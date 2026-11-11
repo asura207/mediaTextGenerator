@@ -22,7 +22,7 @@ _setup_cuda_dlls()
 
 from faster_whisper import WhisperModel
 from app.config import get_whisper_config
-from app.services.srt_generator import optimize_subtitle_timing
+from app.services.srt_generator import optimize_subtitle_timing, format_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +74,6 @@ def unload_whisper_model():
         gc.collect()
         logger.info("Unloaded Whisper model from GPU VRAM to maximize free memory for LLM refinement.")
 
-def format_timestamp(seconds: float) -> str:
-    """Formats seconds to standard SRT timestamp: HH:MM:SS,mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int(round((seconds - int(seconds)) * 1000))
-    if millis >= 1000:
-        secs += 1
-        millis = 0
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def transcribe_audio(
     audio_path: Path,

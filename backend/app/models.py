@@ -1,14 +1,6 @@
 from typing import List, Optional, Any
 from pydantic import BaseModel, Field, model_validator
-
-def format_timestamp(seconds: float) -> str:
-    hrs = int(seconds // 3600)
-    mins = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int(round((seconds - int(seconds)) * 1000))
-    if millis >= 1000:
-        millis = 999
-    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+from app.services.srt_generator import format_timestamp
 
 class SubtitleSegment(BaseModel):
     index: int = 0

@@ -28,9 +28,11 @@
 * **음성 인식 (STT)**: `faster-whisper` (NVIDIA CUDA GPU 가속, float16 연산, RTX 4070 Ti 최적화, CPU 폴백)
 * **문맥 교정 & 번역 (LLM)**: `ollama` Python SDK (로컬 Ollama 서비스 연동, 기본 모델: `qwen2.5:14b`, `gemma4:12b` 등 지원)
 * **자막 처리**: `pysrt` (표준 SubRip `.srt` 파싱/생성, 타임스탬프 갭/중첩 자동 최적화)
-* **데이터베이스**: PostgreSQL (`sqlalchemy` 엔진, `psycopg2-binary`, 커넥션 풀링 및 자동 재연결)
-* **환경 변수 관리**: `python-dotenv` (`.env` 자동 로드)
-* **비동기 처리**: `aiofiles` (대용량 비디오 청크 스트리밍), FastAPI `BackgroundTasks`
+* **데이터베이스**: **듀얼 DB(Dual DB) 완벽 지원**
+  * **SQLite**: Python 내장 파일 DB (`backend/data/transm.db`, 별도 DB 설치 필요 없음, WAL 모드 및 Concurrency Pragma 적용, 비개발자 기본 추천)
+  * **PostgreSQL**: 대규모 동시성 RDB (`psycopg2-binary`, 커넥션 풀링, 데이터베이스 미존재 시 자동 생성 지원)
+* **환경 변수 및 설치 마법사**: `python-dotenv` (`.env` 자동 로드) 및 대화형 설치 마법사(`setup_wizard.py`) 내장
+* **비동기 처리 & 동시성**: `aiofiles` (대용량 비디오 청크 스트리밍), `starlette.concurrency.run_in_threadpool` (대용량 디렉터리 재귀 스캔 및 ZIP 일괄 압축 비동기 스레드 오프로드), FastAPI `BackgroundTasks` (파이프라인 백그라운드 구동)
 
 ### 2.2 Frontend 기술 스택
 * **프레임워크**: React 18, Vite 5
@@ -39,6 +41,20 @@
 * **미디어 재생**: `react-player` (동영상-자막 타임스탬프 실시간 동기화 및 탐색)
 * **네트워크 통신**: `axios` (대용량 업로드 진행률 `onUploadProgress` 실시간 프로그레스 바)
 * **파일 저장**: `file-saver` (SRT 및 ZIP 일괄 다운로드)
+
+### 2.3 시스템 요구 사양 (권장 및 최소 사양)
+* **권장 사양 (현재 개발 PC 기준 최적 스펙)**:
+  * **OS**: Windows 11 64-bit (또는 Linux Ubuntu 22.04+)
+  * **CPU**: AMD Ryzen 7 7800X3D (8코어 16스레드) / Intel Core i7 13세대 이상
+  * **RAM**: 32 GB DDR5 이상
+  * **GPU**: NVIDIA GeForce RTX 4070 Ti (12GB VRAM) 이상
+  * **권장 AI 조합**: faster-whisper `large-v3-turbo` (CUDA float16) + Ollama `qwen2.5:14b`
+* **최소 사양 (저사양 PC / 노트북)**:
+  * **OS**: Windows 10 64-bit / Linux / macOS
+  * **CPU**: 4코어 8스레드 이상 (Intel Core i5 8세대 / AMD Ryzen 5 2600 이상)
+  * **RAM**: 8 GB 이상 (16 GB 권장)
+  * **GPU**: NVIDIA GTX 1660 / RTX 3050 (4~6GB VRAM) 또는 CPU 연산 모드
+  * **최소 AI 조합**: whisper `small` / `medium` (CPU/GPU int8) + Ollama `qwen2.5:3b` / `qwen2.5:7b`
 
 ---
 
@@ -88,7 +104,9 @@
     * `sanitize_subtitle_text` 및 `is_ai_meta_response` 필터로 전각 특수기호 제거 및 첫 번째 유효 한국어 대사만 정제 추출.
 * **5단계: SRT 생성 및 타임스탬프 최적화**:
   * `pysrt` 기반 표준 UTF-8 `.srt` 파일 생성.
-  * 자막 간 겹침 방지 및 최소/최대 노출 시간 최적화.
+  * 초/분 자리올림(Carry-over) 및 음수 시간값 완벽 방어 (`total_ms = max(0, int(round(seconds * 1000)))`).
+  * 연속된 자막 간 겹침 방지 및 50ms 트랜지션 갭 보장 (`min(target_end, max(start + 0.1, next_start - 0.05))`).
+  * 음성 종료 시 잔여 자막 즉시 사라짐 및 최소(0.2s)/최대(5.8s) 가독성 노출 시간 최적화.
 
 ---
 
@@ -146,6 +164,21 @@
 
 ---
 
+### 3.7 비개발자를 위한 대화형 설치 마법사 (`setup_wizard.py`) & 원클릭 런처 (`start.bat`)
+* **원클릭 더블클릭 구동**:
+  * 비개발자가 `start.bat`을 더블클릭하면, Python 가상환경(`backend/venv`) 생성, 필수 라이브러리(`requirements.txt`) 설치, 환경설정(`.env`) 생성까지 자동으로 진행.
+* **대화형 설정 마법사 (`setup_wizard.py`)**:
+  * **하드웨어 자동 감지 & 3대 사양 프리셋 선택지 제공**:
+    * 시스템의 CPU, RAM, NVIDIA GPU(VRAM)를 자동 분석하여 사용자 PC에 가장 최적화된 사양 프리셋 추천:
+      1) **[1] 🚀 권장 고사양 프리셋**: RTX 4070 Ti(12GB VRAM), 32GB RAM 최적화 (`qwen2.5:14b` + `large-v3-turbo` CUDA float16 + SQLite)
+      2) **[2] ⚖️ 표준 밸런스 프리셋**: RTX 3060~4060(6~8GB VRAM), 16GB RAM 최적화 (`qwen2.5:7b` + `large-v3-turbo` CUDA float16 + SQLite)
+      3) **[3] 🍃 저사양 / 노트북 프리셋**: 내장 그래픽 또는 4GB 이하 GPU, 8GB RAM 최적화 (`qwen2.5:3b` + `small` CPU/GPU int8 + SQLite, 경량 배치)
+      4) **[4] ⚙️ 고급 사용자 맞춤 설정**: DB(SQLite vs PostgreSQL) 및 LLM/Whisper 모델 개별 수동 선택
+  * **원클릭 AI 모델 자동 설치**: 선택한 사양에 맞추어 Ollama 모델을 실시간 프로그레스 바로 자동 다운로드(`ollama pull`).
+  * **브라우저 자동 오픈**: 백엔드와 프론트엔드가 실행되면 기본 브라우저를 자동으로 띄워 즉시 작업 가능.
+
+---
+
 ## 4. 환경 변수 및 설정 프로퍼티 명세 (비식별화)
 
 모든 민감 접속 정보(IP, 포트, DB 계정, 비밀번호 등)는 코드베이스에서 완전히 분리되어 `.env` 파일로부터 로드됩니다.  
@@ -155,35 +188,41 @@
 ```env
 # ==============================================================================
 # TransM Environment Configuration Template (.env.example)
-# Copy this file to '.env' and fill in your actual environment properties.
+# Copy this file to '.env' or run 'python setup_wizard.py' / 'start.bat'
 # ==============================================================================
 
 # 1. Server Configuration
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8000
 
-# 2. PostgreSQL Database Connection
-POSTGRES_HOST=your-db-host
+# 2. Database Configuration
+# - DB_TYPE: 'sqlite' (파일 DB, 별도 설치 불필요 - 기본 추천) OR 'postgres' (외부 RDB)
+DB_TYPE=sqlite
+SQLITE_PATH=backend/data/transm.db
+
+# 3. PostgreSQL Database Connection (Used only when DB_TYPE=postgres)
+POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
-POSTGRES_DB=your_database_name
-POSTGRES_USER=your_db_user
+POSTGRES_DB=transm
+POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your_db_password
 
-# 3. Ollama LLM Service Configuration
+# 4. Ollama LLM Service Configuration
+# - Recommended Models: qwen2.5:14b, qwen2.5:7b, qwen2.5:3b, gemma4:12b
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:14b
 LLM_BATCH_SIZE=10
 
-# 4. Whisper STT Configuration
-# Models: large-v3-turbo, large-v3, medium, small, base
-# Device: cuda (GPU acceleration), cpu
-# Compute Type: float16, int8_float16, int8
+# 5. Whisper STT Configuration
+# - Models: large-v3-turbo, large-v3, medium, small, base
+# - Device: cuda (GPU acceleration), cpu
+# - Compute Type: float16, int8_float16, int8
 WHISPER_MODEL_SIZE=large-v3-turbo
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
 
-# 5. Local Media Search Directories (Comma or semicolon separated paths)
-# Example: D:\Media\Videos,D:\Movies,E:\Anime
+# 6. Local Media Search Directories (Comma or semicolon separated paths)
+# Example: D:\Videos,D:\Media,E:\Movies
 MEDIA_SCAN_DIRS=
 ```
 

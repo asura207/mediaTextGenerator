@@ -235,7 +235,7 @@ export default function SubtitleEditor({ taskId, initialSubtitles, onSeekVideo, 
                   {seg.raw_text && seg.raw_text !== seg.refined_text && (
                     <span className="text-[10px] text-purple-400/80 flex items-center space-x-1">
                       <Sparkles className="w-2.5 h-2.5" />
-                      <span>Gemma 12B 교정됨</span>
+                      <span>AI 문맥 교정됨</span>
                     </span>
                   )}
                   <button

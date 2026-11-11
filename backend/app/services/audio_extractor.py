@@ -5,6 +5,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 def _extract_audio_ffmpeg(video_path: Path, output_audio_path: Path) -> Path:
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
         "-i", str(video_path),
@@ -21,6 +22,11 @@ def _extract_audio_ffmpeg(video_path: Path, output_audio_path: Path) -> Path:
         logger.info("Audio extracted successfully with dynamic loudness normalization via ffmpeg.")
         return output_audio_path
     except subprocess.CalledProcessError as e:
+        if output_audio_path.exists():
+            try:
+                output_audio_path.unlink()
+            except Exception:
+                pass
         err_msg = e.stderr.decode("utf-8", errors="ignore")
         if "Output file does not contain any stream" in err_msg or "matches no streams" in err_msg:
             raise ValueError("오디오 추출 실패: 해당 동영상 파일에 오디오(음성) 트랙이 포함되어 있지 않습니다. (The provided video file does not contain an audio track.)")
@@ -30,8 +36,18 @@ def _extract_audio_ffmpeg(video_path: Path, output_audio_path: Path) -> Path:
         logger.error(f"FFmpeg audio extraction failed: {tail_err}")
         raise RuntimeError(f"Audio extraction failed: {tail_err}")
     except ValueError:
+        if output_audio_path.exists():
+            try:
+                output_audio_path.unlink()
+            except Exception:
+                pass
         raise
     except Exception as e:
+        if output_audio_path.exists():
+            try:
+                output_audio_path.unlink()
+            except Exception:
+                pass
         logger.error(f"Failed to extract audio: {str(e)}")
         raise RuntimeError(f"Audio extraction error: {str(e)}")
 
@@ -43,6 +59,7 @@ def extract_audio(video_path: Path, output_audio_path: Path) -> Path:
     Recommended audio specs for Whisper: 16kHz mono WAV.
     """
     logger.info(f"Extracting audio from {video_path} to {output_audio_path}")
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Fast path: High-performance FFmpeg with dynaudnorm dynamic volume normalization
     try:
@@ -74,6 +91,11 @@ def extract_audio(video_path: Path, output_audio_path: Path) -> Path:
         logger.info("Audio extracted successfully via moviepy.")
         return output_audio_path
     except Exception as e:
+        if output_audio_path.exists():
+            try:
+                output_audio_path.unlink()
+            except Exception:
+                pass
         logger.warning(f"MoviePy extraction failed ({e}), re-raising...")
         raise RuntimeError(f"Audio extraction failed: {e}")
 

@@ -12,7 +12,8 @@ import {
   Save,
   Zap,
   Server,
-  Layers
+  Layers,
+  Database
 } from 'lucide-react';
 import { getSystemSettings, updateSystemSettings, pullOllamaModel, requeueCompletedStudioQueue } from '../api/client';
 
@@ -29,6 +30,7 @@ export default function AdminSettings({ onSettingsUpdated }) {
   const [whisperDevices, setWhisperDevices] = useState([]);
   const [whisperComputeTypes, setWhisperComputeTypes] = useState([]);
   const [ollamaHost, setOllamaHost] = useState('http://localhost:11434');
+  const [dbInfo, setDbInfo] = useState({ type: 'sqlite', name: 'backend/data/transm.db' });
 
   // Form state
   const [selectedOllamaModel, setSelectedOllamaModel] = useState('qwen2.5:14b');
@@ -57,6 +59,12 @@ export default function AdminSettings({ onSettingsUpdated }) {
       if (data?.whisper_devices) setWhisperDevices(data.whisper_devices);
       if (data?.whisper_compute_types) setWhisperComputeTypes(data.whisper_compute_types);
       if (data?.ollama_host) setOllamaHost(data.ollama_host);
+      if (data?.db_type) {
+        setDbInfo({
+          type: data.db_type,
+          name: data.connected_db || (data.db_type === 'sqlite' ? 'SQLite 파일 DB' : 'PostgreSQL RDB')
+        });
+      }
     } catch (err) {
       setStatusMsg({
         type: 'error',
@@ -193,6 +201,14 @@ export default function AdminSettings({ onSettingsUpdated }) {
               </h1>
               <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                 실시간 즉시 반영
+              </span>
+              <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold flex items-center border ${
+                dbInfo.type === 'sqlite' 
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' 
+                  : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30'
+              }`}>
+                <Database className="w-3 h-3 mr-1 inline" />
+                <span>DB: {dbInfo.type === 'sqlite' ? 'SQLite (파일 DB)' : 'PostgreSQL'}</span>
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1 leading-relaxed">

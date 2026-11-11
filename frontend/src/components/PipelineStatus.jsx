@@ -2,9 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { Loader2, CheckCircle2, Music, Mic, Sparkles, FileText, AlertTriangle, Clock, Zap } from 'lucide-react';
 
 const STAGES = [
-  { id: 1, label: '오디오 추출', desc: 'moviepy 오디오 스트림 분리', icon: Music, minProgress: 25, estTime: '약 30초~1분' },
-  { id: 2, label: '음성 인식(STT)', desc: 'faster-whisper 타임스탬프 추출', icon: Mic, minProgress: 50, estTime: '약 3~5분 (CUDA)' },
-  { id: 3, label: 'Gemma4 자막 교정', desc: '로컬 Ollama gemma4:12b 문맥 정제', icon: Sparkles, minProgress: 75, estTime: '분량별 약 5~15분' },
+  { id: 1, label: '오디오 추출', desc: 'moviepy/ffmpeg 오디오 분리', icon: Music, minProgress: 25, estTime: '약 30초~1분' },
+  { id: 2, label: '음성 인식(STT)', desc: 'faster-whisper 정밀 타임스탬프 추출', icon: Mic, minProgress: 50, estTime: '약 2~4분 (CUDA 가속)' },
+  { id: 3, label: 'LLM 문맥 교정 & 번역', desc: '로컬 Ollama 대화체 의역 & 문맥 정제', icon: Sparkles, minProgress: 75, estTime: '분량별 약 3~8분' },
   { id: 4, label: 'SRT 자막 생성', desc: '표준 pysrt 자막 파일 패키징', icon: FileText, minProgress: 100, estTime: '약 5초' },
 ];
 
@@ -37,8 +37,8 @@ export default function PipelineStatus({ task }) {
   const getEstimatedRemaining = () => {
     if (progress >= 95) return '마무리 중 (약 30초 이내)';
     if (progress >= 75) return '약 2~4분 남음 (자막 정리 중)';
-    if (progress >= 50) return '약 5~10분 남음 (Gemma 12B 문맥 교정 중)';
-    if (progress >= 25) return '약 8~12분 남음 (CUDA 음성인식 중)';
+    if (progress >= 50) return '약 3~6분 남음 (LLM 문맥 교정 & 번역 중)';
+    if (progress >= 25) return '약 5~8분 남음 (CUDA 음성인식 중)';
     return '약 10~15분 예상';
   };
 
@@ -93,10 +93,10 @@ export default function PipelineStatus({ task }) {
           <div className="col-span-2 sm:col-span-1 p-3 rounded-xl bg-slate-950/70 border border-teal-500/30 space-y-0.5">
             <span className="text-[11px] text-teal-400 font-medium flex items-center space-x-1">
               <Zap className="w-3.5 h-3.5 text-teal-400" />
-              <span>하드웨어 가속</span>
+              <span>가속 모드</span>
             </span>
             <p className="text-xs font-semibold text-teal-300 truncate">
-              RTX 4070 Ti (CUDA)
+              CUDA GPU (float16)
             </p>
           </div>
         </div>

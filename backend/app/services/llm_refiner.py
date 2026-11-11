@@ -35,8 +35,8 @@ def resolve_active_ollama_model(client: Optional[ollama.Client] = None) -> str:
             if configured in _cached_installed_models or any(n.startswith(configured) for n in _cached_installed_models):
                 return configured
             return _cached_installed_models[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not query installed Ollama models ({e}), falling back to configured '{configured}'")
     return configured
 
 RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
@@ -607,11 +607,13 @@ def refine_subtitles_with_llm(
         batch_size = get_llm_batch_size()
 
     try:
-        client = ollama.Client(host=OLLAMA_HOST)
+        client = ollama.Client(host=OLLAMA_HOST, timeout=120.0)
+        # Probe connection to Ollama server early
+        client.list()
         active_model = resolve_active_ollama_model(client)
-        logger.info(f"Connecting to Ollama host: {OLLAMA_HOST}, model: {active_model}")
+        logger.info(f"Connected to Ollama host: {OLLAMA_HOST}, active model: {active_model}")
     except Exception as e:
-        logger.warning(f"Could not connect to Ollama ({e}). Skipping LLM refinement and keeping raw STT text.")
+        logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement and keeping raw STT text.")
         return segments
 
     segments_by_id = {s["index"]: s for s in segments}

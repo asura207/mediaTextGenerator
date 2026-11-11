@@ -209,10 +209,14 @@ def translate_subtitles_list(
         batch_size = get_llm_batch_size()
 
     target_lang_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
-    client = ollama.Client(host=OLLAMA_HOST)
-    active_model = resolve_active_ollama_model(client)
-    logger.info(f"Connecting to Ollama host: {OLLAMA_HOST}, model: {active_model} for translation to {target_lang_name}")
-    client.list()
+    try:
+        client = ollama.Client(host=OLLAMA_HOST, timeout=120.0)
+        client.list()
+        active_model = resolve_active_ollama_model(client)
+        logger.info(f"Connected to Ollama host: {OLLAMA_HOST}, model: {active_model} for translation to {target_lang_name}")
+    except Exception as e:
+        logger.warning(f"Could not connect to Ollama ({e}). Returning original segments without translation.")
+        return segments
 
     segments_by_id = {s.get("index") or s.get("id"): s for s in segments}
 

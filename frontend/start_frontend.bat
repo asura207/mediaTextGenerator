@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title TransM - Frontend (Vite :5173)
 cd /d "%~dp0"
 echo ========================================================

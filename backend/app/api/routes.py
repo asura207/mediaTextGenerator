@@ -15,6 +15,7 @@ from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException, status, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
+from starlette.concurrency import run_in_threadpool
 import aiofiles
 import pysrt
 import ollama
@@ -84,8 +85,8 @@ def save_task_state(task_id: str):
 
 def generate_web_preview(video_path: Path, preview_path: Path) -> bool:
     """Generates a fast, lightweight H.264/AAC MP4 preview for web browser playback."""
+    temp_preview = preview_path.with_suffix(".tmp.mp4")
     try:
-        temp_preview = preview_path.with_suffix(".tmp.mp4")
         cmd = [
             "ffmpeg",
             "-i", str(video_path),
@@ -110,6 +111,12 @@ def generate_web_preview(video_path: Path, preview_path: Path) -> bool:
     except Exception as e:
         logger.warning(f"Web preview conversion failed for {video_path.name}: {e}")
         return False
+    finally:
+        if temp_preview.exists():
+            try:
+                temp_preview.unlink()
+            except Exception:
+                pass
 
 
 _LOCAL_MEDIA_INDEX: Dict[str, Path] = {}
@@ -754,37 +761,8 @@ class BatchDownloadRequest(BaseModel):
     undownloaded_only: Optional[bool] = False
 
 
-async def _execute_batch_download(
-    req: Optional[BatchDownloadRequest],
-    undownloaded_only: bool
-):
-    target_ids = req.task_ids if req and req.task_ids else None
-    task_type_filter = req.task_type if req and req.task_type else None
-
-    # Retrieve completed tasks (filter out 0-subtitle tasks from batch downloads)
-    all_completed = db.get_completed_tasks(limit=50000, task_type=task_type_filter)
-    all_completed = [t for t in all_completed if (t.get("subtitle_count") or 0) > 0]
-
-    if undownloaded_only:
-        eligible_tasks = [
-            t for t in all_completed
-            if (t.get("download_count") or 0) == 0 and not t.get("downloaded")
-        ]
-    else:
-        eligible_tasks = all_completed
-
-    # If specific task_ids requested, filter further
-    if target_ids is not None:
-        target_id_set = set(target_ids)
-        eligible_tasks = [t for t in eligible_tasks if t["task_id"] in target_id_set]
-
-    if not eligible_tasks:
-        if undownloaded_only:
-            msg = "다운로드 대상인 미다운로드 작업이 없습니다. 이미 모든 자막을 다운로드했거나 대상이 존재하지 않습니다."
-        else:
-            msg = "일괄 다운로드할 완료 작업이 없습니다."
-        raise HTTPException(status_code=400, detail=msg)
-
+def _build_zip_archive_sync(eligible_tasks: List[Dict[str, Any]]) -> tuple[bytes, List[str]]:
+    """Synchronous CPU/disk bound worker that builds the ZIP file in threadpool."""
     zip_buffer = io.BytesIO()
     used_entry_names: set[str] = set()
     downloaded_ids: List[str] = []
@@ -794,7 +772,6 @@ async def _execute_batch_download(
             t_id = t["task_id"]
             raw_fn = t.get("filename") or f"subtitles_{t_id[:8]}"
 
-            # Determine clean base name
             base_name = Path(raw_fn).stem
             if base_name.endswith(".srt"):
                 base_name = Path(base_name).stem
@@ -803,18 +780,15 @@ async def _execute_batch_download(
                     base_name = base_name[:-len(lang_code)]
                     break
 
-            # Sanitize for safe filesystem filename inside zip
             safe_base = re.sub(r'[\\/*?:"<>|]', '_', base_name).strip() or f"subtitles_{t_id[:8]}"
             entry_name = f"{safe_base}.srt"
 
-            # Avoid filename collisions inside the zip
             counter = 1
             while entry_name in used_entry_names:
                 entry_name = f"{safe_base} ({counter}).srt"
                 counter += 1
             used_entry_names.add(entry_name)
 
-            # Retrieve SRT bytes
             srt_bytes = b""
             srt_path = task_srt_paths.get(t_id) or (PROCESSED_DIR / f"{t_id}.srt")
             if not srt_path.exists() and t.get("srt_path"):
@@ -827,7 +801,6 @@ async def _execute_batch_download(
                     logger.warning(f"Error reading SRT file for {t_id}: {read_err}")
 
             if not srt_bytes:
-                # Fallback: regenerate SRT from segments
                 try:
                     _, segments = load_segments_from_task(t_id)
                     if segments:
@@ -838,15 +811,54 @@ async def _execute_batch_download(
                             s_end = seg.get("end_str") or "00:00:05,000"
                             s_text = seg.get("refined_text") or seg.get("text") or ""
                             out.write(f"{idx}\n{s_start} --> {s_end}\n{s_text}\n\n")
-                        srt_bytes = out.getvalue().encode("utf-8")
+                        srt_bytes = out.getvalue().encode("utf-8-sig")
                 except Exception as gen_err:
                     logger.warning(f"Error generating fallback SRT for {t_id}: {gen_err}")
 
             if srt_bytes:
+                # Ensure UTF-8 BOM for maximum compatibility with players like Series On
+                if not srt_bytes.startswith(b'\xef\xbb\xbf'):
+                    srt_bytes = b'\xef\xbb\xbf' + srt_bytes
                 zinfo = zipfile.ZipInfo(filename=entry_name, date_time=datetime.now().timetuple()[:6])
                 zinfo.compress_type = zipfile.ZIP_DEFLATED
                 zf.writestr(zinfo, srt_bytes)
                 downloaded_ids.append(t_id)
+
+    return zip_buffer.getvalue(), downloaded_ids
+
+
+async def _execute_batch_download(
+    req: Optional[BatchDownloadRequest],
+    undownloaded_only: bool
+):
+    target_ids = req.task_ids if req and req.task_ids else None
+    task_type_filter = req.task_type if req and req.task_type else None
+
+    # Retrieve completed tasks (filter out 0-subtitle tasks from batch downloads)
+    all_completed = await run_in_threadpool(db.get_completed_tasks, limit=50000, task_type=task_type_filter)
+    all_completed = [t for t in all_completed if (t.get("subtitle_count") or 0) > 0]
+
+    if undownloaded_only:
+        eligible_tasks = [
+            t for t in all_completed
+            if (t.get("download_count") or 0) == 0 and not t.get("downloaded")
+        ]
+    else:
+        eligible_tasks = all_completed
+
+    if target_ids is not None:
+        target_id_set = set(target_ids)
+        eligible_tasks = [t for t in eligible_tasks if t["task_id"] in target_id_set]
+
+    if not eligible_tasks:
+        if undownloaded_only:
+            msg = "다운로드 대상인 미다운로드 작업이 없습니다. 이미 모든 자막을 다운로드했거나 대상이 존재하지 않습니다."
+        else:
+            msg = "일괄 다운로드할 완료 작업이 없습니다."
+        raise HTTPException(status_code=400, detail=msg)
+
+    # Build ZIP archive in worker threadpool to avoid blocking FastAPI event loop
+    zip_bytes, downloaded_ids = await run_in_threadpool(_build_zip_archive_sync, eligible_tasks)
 
     if not downloaded_ids:
         raise HTTPException(status_code=404, detail="다운로드할 수 있는 자막 파일을 찾을 수 없습니다.")
@@ -854,7 +866,7 @@ async def _execute_batch_download(
     # Increment download count and update timestamp for each task
     for t_id in downloaded_ids:
         try:
-            db.increment_download_count(t_id)
+            await run_in_threadpool(db.increment_download_count, t_id)
         except Exception as e:
             logger.warning(f"Failed to increment download count for {t_id}: {e}")
 
@@ -865,7 +877,7 @@ async def _execute_batch_download(
     content_disposition = f'attachment; filename="transm_subtitles.zip"; filename*=UTF-8\'\'{encoded_filename}'
 
     return Response(
-        content=zip_buffer.getvalue(),
+        content=zip_bytes,
         media_type="application/zip",
         headers={
             "Content-Disposition": content_disposition,
@@ -1616,6 +1628,22 @@ def _natural_sort_key(text_val: str):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", text_val)]
 
 
+def _browse_folders_sync(target_dir: Path) -> tuple[List[Dict[str, str]], int]:
+    """Scans direct entries in folder using worker thread."""
+    folders = []
+    direct_video_count = 0
+    for entry in target_dir.iterdir():
+        try:
+            if entry.is_dir() and not entry.name.startswith("$"):
+                folders.append({"name": entry.name, "path": str(entry)})
+            elif entry.is_file() and entry.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+                direct_video_count += 1
+        except Exception:
+            continue
+    folders.sort(key=lambda x: _natural_sort_key(x["name"]))
+    return folders, direct_video_count
+
+
 @router.get("/studio-queue/browse-folders")
 async def browse_local_folders_endpoint(path: Optional[str] = None):
     """
@@ -1651,21 +1679,11 @@ async def browse_local_folders_endpoint(path: Optional[str] = None):
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"지정한 폴더를 찾을 수 없습니다: {target_str}")
 
-    folders = []
-    direct_video_count = 0
     try:
-        for entry in target_dir.iterdir():
-            try:
-                if entry.is_dir() and not entry.name.startswith("$"):
-                    folders.append({"name": entry.name, "path": str(entry)})
-                elif entry.is_file() and entry.suffix.lower() in VALID_VIDEO_EXTENSIONS:
-                    direct_video_count += 1
-            except Exception:
-                continue
+        folders, direct_video_count = await run_in_threadpool(_browse_folders_sync, target_dir)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"폴더 접근 오류: {e}")
 
-    folders.sort(key=lambda x: _natural_sort_key(x["name"]))
     parent_path = str(target_dir.parent) if target_dir.parent != target_dir else ""
 
     return {
@@ -1677,22 +1695,8 @@ async def browse_local_folders_endpoint(path: Optional[str] = None):
     }
 
 
-@router.post("/studio-queue/add-folder")
-async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, background_tasks: BackgroundTasks):
-    """
-    Recursively searches the specified folder and ALL its subfolders (os.walk),
-    registers every discovered video file into studio_queue_items in natural order,
-    and automatically starts processing!
-    """
-    global _LOCAL_MEDIA_INDEX, _LOCAL_MEDIA_ALL_PATHS
-    raw_path = (payload.folder_path or "").strip().strip('"').strip("'")
-    if not raw_path:
-        raise HTTPException(status_code=400, detail="폴더 경로를 입력하거나 선택해 주세요.")
-
-    root_dir = Path(raw_path)
-    if not root_dir.exists() or not root_dir.is_dir():
-        raise HTTPException(status_code=404, detail=f"폴더가 존재하지 않습니다: {raw_path}")
-
+def _scan_folder_recursive_sync(root_dir: Path) -> tuple[List[Dict[str, Any]], set[str]]:
+    """Worker thread scanner that recursively finds videos without blocking event loop."""
     discovered_videos = []
     subfolders_with_videos = set()
 
@@ -1714,7 +1718,6 @@ async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, backgr
                 except Exception:
                     rel_str = fn
 
-                # If video is inside a subfolder of root_dir, include subfolder in display filename
                 if "/" in rel_str:
                     subfolders_with_videos.add(str(Path(rel_str).parent))
                     display_name = f"{root_dir.name}/{rel_str}"
@@ -1729,17 +1732,37 @@ async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, backgr
                     "size": fsize
                 })
 
+    discovered_videos.sort(key=lambda x: _natural_sort_key(x["rel_sort_key"]))
+    return discovered_videos, subfolders_with_videos
+
+
+@router.post("/studio-queue/add-folder")
+async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, background_tasks: BackgroundTasks):
+    """
+    Recursively searches the specified folder and ALL its subfolders (os.walk),
+    registers every discovered video file into studio_queue_items in natural order,
+    and automatically starts processing!
+    """
+    global _LOCAL_MEDIA_INDEX, _LOCAL_MEDIA_ALL_PATHS
+    raw_path = (payload.folder_path or "").strip().strip('"').strip("'")
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="폴더 경로를 입력하거나 선택해 주세요.")
+
+    root_dir = Path(raw_path)
+    if not root_dir.exists() or not root_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"폴더가 존재하지 않습니다: {raw_path}")
+
+    # Run heavy directory scan off the main event loop
+    discovered_videos, subfolders_with_videos = await run_in_threadpool(_scan_folder_recursive_sync, root_dir)
+
     if not discovered_videos:
         raise HTTPException(
             status_code=400,
             detail=f"선택한 폴더('{root_dir.name}') 및 하위 폴더에 지원되는 동영상 파일이 없습니다."
         )
 
-    # Natural sort by relative path so subfolders and episodes are queued in exact order
-    discovered_videos.sort(key=lambda x: _natural_sort_key(x["rel_sort_key"]))
-
     # Get existing queue to append after current items and avoid exact duplicate waiting items
-    existing_items = db.get_studio_queue()
+    existing_items = await run_in_threadpool(db.get_studio_queue)
     existing_waiting_names = {
         it.get("filename") for it in existing_items if it.get("status") in ("WAITING", "PROCESSING", "UPLOADING")
     }
@@ -1782,7 +1805,7 @@ async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, backgr
         })
 
     if new_queue_items:
-        db.upsert_studio_queue_items(new_queue_items, client_id=payload.client_id or "server_folder_scan")
+        await run_in_threadpool(db.upsert_studio_queue_items, new_queue_items, client_id=payload.client_id or "server_folder_scan")
 
     # Immediately auto-start if idle
     try:
@@ -2224,6 +2247,8 @@ async def get_system_settings_endpoint():
 
     return {
         "current": current,
+        "db_type": "sqlite" if db.is_sqlite_db() else "postgres",
+        "connected_db": db._connected_db_name or ("SQLite" if db.is_sqlite_db() else "PostgreSQL"),
         "ollama_models": merged_ollama_models,
         "installed_ollama_models": [m["name"] for m in installed_list],
         "whisper_models": WHISPER_MODEL_OPTIONS,
