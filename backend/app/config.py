@@ -40,8 +40,15 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 
-# Database Configs (Defaults to 'sqlite' for zero-config out-of-the-box usage)
-DB_TYPE = os.getenv("DB_TYPE", "sqlite").strip().lower()
+# Database Configs (Auto-detects postgres if configured, otherwise defaults to 'sqlite' for zero-config)
+_raw_db_type = os.getenv("DB_TYPE", "").strip().lower()
+if _raw_db_type:
+    DB_TYPE = _raw_db_type
+elif os.getenv("POSTGRES_PASSWORD") or (os.getenv("POSTGRES_HOST") and os.getenv("POSTGRES_HOST") not in ("localhost", "127.0.0.1")):
+    DB_TYPE = "postgres"
+else:
+    DB_TYPE = "sqlite"
+
 SQLITE_PATH = os.getenv("SQLITE_PATH", str(DATA_DIR / "transm.db"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
