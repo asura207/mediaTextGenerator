@@ -86,19 +86,22 @@ def transcribe_audio(
     logger.info(f"Starting STT transcription on {audio_path}")
     model = get_whisper_model()
     
-    # Transcribe with language detection, word timestamps, and high sensitivity for low-volume speech
+    # Transcribe with ultra-high sensitivity for soft dialogue, moans, screams, and non-verbal vocalizations
     segments_generator, info = model.transcribe(
         str(audio_path),
         beam_size=5,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(
-            threshold=0.25,              # Lowered from 0.5 -> detects soft/whispered dialogue
-            min_silence_duration_ms=500, # Silence boundary threshold
-            speech_pad_ms=400            # Preserves subtle initial and trailing speech syllables
+            threshold=0.10,              # Lowered from 0.25 -> 0.10: Captures subtle moans, whispers, crying, and screams
+            min_silence_duration_ms=1000,# Extended from 500ms -> 1000ms: Prevents cutting mid-breath or between moans
+            speech_pad_ms=600            # Increased from 400ms -> 600ms: Protects initial gasps and trailing exhalations
         ),
-        no_speech_threshold=0.4,          # Lowered from 0.6 -> prevents discarding quiet speech
-        condition_on_previous_text=False # Independent decoding avoids silence hallucination cascading
+        no_speech_threshold=0.65,         # Raised from 0.4 -> 0.65: Prevents Whisper from prematurely discarding emotional non-verbal vocalizations
+        logprob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        condition_on_previous_text=False, # Independent decoding avoids silence hallucination cascading
+        initial_prompt="ああ、あっ、うっ、んっ、きゃあ、はぁ、いや、痛い、すごい、やめて、だめ… 아, 앗, 으윽, 꺄악, 하아, 싫어, 아파, 흑... Oh, Ah, Ugh, Wow"
     )
     
     logger.info(f"Detected language '{info.language}' with probability {info.language_probability:.2f}")
