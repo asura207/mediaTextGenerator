@@ -648,3 +648,4 @@ export default function ProperNounDictionary() {
     </div>
   );
 }
+

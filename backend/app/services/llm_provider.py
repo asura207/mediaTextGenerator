@@ -302,3 +302,4 @@ def test_provider_connectivity(
             "error": str(e),
             "message": f"연결 실패: {str(e)}"
         }
+

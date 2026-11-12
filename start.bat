@@ -9,17 +9,23 @@ echo.
 
 cd /d "%~dp0"
 
-:: 1. Check Python installation
-where python >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python이 설치되어 있지 않거나 환경 변수 PATH에 등록되지 않았습니다!
-    echo Python 3.10 이상을 설치하신 후 다시 실행해 주세요. (https://www.python.org)
-    pause
-    exit /b 1
+:: 0. Clean up any previous lingering instances on ports 8000 and 5173
+for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":8000" ^| findstr "LISTENING"') do (
+    taskkill /f /t /pid %%a >nul 2>&1
+)
+for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":5173" ^| findstr "LISTENING"') do (
+    taskkill /f /t /pid %%a >nul 2>&1
 )
 
-:: 2. Check Virtual Environment
+:: 1. Check Virtual Environment or Python installation
 if not exist "%~dp0backend\venv\Scripts\python.exe" (
+    where python >nul 2>&1
+    if %errorlevel% neq 0 (
+        echo [ERROR] Python이 설치되어 있지 않거나 환경 변수 PATH에 등록되지 않았습니다!
+        echo Python 3.10 이상을 설치하신 후 다시 실행해 주세요. (https://www.python.org)
+        pause
+        exit /b 1
+    )
     echo [*] 최초 실행 감지: Python 가상환경(venv)을 생성합니다...
     python -m venv "%~dp0backend\venv"
     if %errorlevel% neq 0 (
@@ -32,7 +38,7 @@ if not exist "%~dp0backend\venv\Scripts\python.exe" (
     "%~dp0backend\venv\Scripts\python.exe" -m pip install -r "%~dp0backend\requirements.txt"
 )
 
-:: 3. Check .env (Run setup_wizard if missing)
+:: 2. Check .env (Run setup_wizard if missing)
 if not exist "%~dp0.env" (
     echo [*] 환경설정 파일(.env)이 없습니다. 초기 간편 설정 마법사를 시작합니다...
     echo.
@@ -44,16 +50,16 @@ if not exist "%~dp0.env" (
     )
 )
 
-:: 4. Check Node.js path in dev tools if exists
+:: 3. Check Node.js path in dev tools if exists
 if exist "d:\dev\tools\nodejs" (
     set "PATH=d:\dev\tools\nodejs;%PATH%"
 )
 
-:: 5. Launch Backend Server
+:: 4. Launch Backend Server
 echo [*] Starting Backend Server (FastAPI on Port 8000)...
-start "TransM - Backend API" cmd /k "cd /d ""%~dp0backend"" && "".\venv\Scripts\python.exe"" run.py"
+start "TransM - Backend API" cmd /k "cd /d "%~dp0backend" && "%~dp0backend\venv\Scripts\python.exe" run.py"
 
-:: 6. Check and Launch Frontend
+:: 5. Check and Launch Frontend
 set "DEV_FRONTEND=0"
 where npm >nul 2>&1
 if %errorlevel% equ 0 (
@@ -64,7 +70,7 @@ if %errorlevel% equ 0 (
         cd /d "%~dp0"
     )
     echo [*] Starting Frontend Server (Vite on Port 5173)...
-    start "TransM - Frontend Studio" cmd /k "cd /d ""%~dp0frontend"" && npm run dev"
+    start "TransM - Frontend Studio" cmd /k "cd /d "%~dp0frontend" && npm run dev"
     set "DEV_FRONTEND=1"
 ) else (
     echo [INFO] Node.js가 감지되지 않아 백엔드 통합 웹 UI(Port 8000)로 구동합니다.
@@ -81,7 +87,7 @@ echo - Backend API Docs:    http://localhost:8000/docs
 echo ================================================================================
 echo.
 
-ping 127.0.0.1 -n 4 >nul
+ping 127.0.0.1 -n 6 >nul
 if "%DEV_FRONTEND%"=="1" (
     start http://localhost:5173
 ) else (
