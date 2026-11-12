@@ -885,50 +885,69 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
         res_comp = conn.execute(text(
             "SELECT task_id, filename FROM completed_tasks WHERE task_type = 'studio' OR task_type IS NULL ORDER BY completed_at ASC;"
         )).fetchall()
-        completed_rows = [(str(r[0]), str(r[1])) for r in res_comp if r[0]]
+        completed_rows = [(str(r[0]), str(r[1])) for r in res_comp if r[0] and r[1]]
         for tid, _ in completed_rows:
             purged_task_ids.add(tid)
 
-        # 2. Gather studio tasks in transm_tasks (using cross-DB LOWER(filename) NOT LIKE '%.srt')
-        if reset_processing:
-            res_tasks = conn.execute(text(
-                "SELECT task_id, filename FROM transm_tasks WHERE LOWER(filename) NOT LIKE '%.srt';"
-            )).fetchall()
-        else:
-            res_tasks = conn.execute(text(
-                "SELECT task_id, filename FROM transm_tasks WHERE status IN ('COMPLETED', 'FAILED') AND LOWER(filename) NOT LIKE '%.srt';"
-            )).fetchall()
+        # 2. Gather all studio tasks from transm_tasks
+        res_tasks = conn.execute(text(
+            "SELECT task_id, filename FROM transm_tasks WHERE LOWER(filename) NOT LIKE '%.srt';"
+        )).fetchall()
         for r in res_tasks:
             if r[0]:
                 purged_task_ids.add(str(r[0]))
 
         # 3. Also gather task_ids linked in studio_queue_items
-        if reset_processing:
-            res_q = conn.execute(text("SELECT task_id FROM studio_queue_items WHERE task_id IS NOT NULL;")).fetchall()
-        else:
-            res_q = conn.execute(text("SELECT task_id FROM studio_queue_items WHERE status IN ('COMPLETED', 'FAILED') AND task_id IS NOT NULL;")).fetchall()
+        res_q = conn.execute(text("SELECT task_id FROM studio_queue_items WHERE task_id IS NOT NULL;")).fetchall()
         for r in res_q:
             if r[0]:
                 purged_task_ids.add(str(r[0]))
 
-        # 4. Ensure any completed studio task whose filename is missing from studio_queue_items is inserted
+        # 4. Build comprehensive candidate set of (filename -> task_id)
+        candidate_map: Dict[str, str] = {}
+        for tid, fname in completed_rows:
+            if fname and fname not in candidate_map:
+                candidate_map[fname] = tid
+
+        for r in res_tasks:
+            if r[0] and r[1]:
+                fn = str(r[1])
+                if fn not in candidate_map:
+                    candidate_map[fn] = str(r[0])
+
+        # Also inspect UPLOAD_DIR for uploaded video files
+        try:
+            from app.config import UPLOAD_DIR
+            valid_exts = {'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'ts', 'webm', 'm4v', 'mpg', 'mpeg', 'm2ts', 'mts', 'vob', 'ogv', '3gp'}
+            if UPLOAD_DIR.exists():
+                for f in UPLOAD_DIR.iterdir():
+                    if f.is_file() and f.stat().st_size > 0 and f.suffix.lower().lstrip('.') in valid_exts:
+                        clean_fn = f.name
+                        if "_" in clean_fn and len(clean_fn.split("_")[0]) in (32, 36):
+                            clean_fn = clean_fn.split("_", 1)[1]
+                        if clean_fn not in candidate_map:
+                            candidate_map[clean_fn] = f"upload_{f.stem[:8]}"
+        except Exception:
+            pass
+
+        # 5. Ensure all candidate filenames are registered into studio_queue_items
         existing_fnames_res = conn.execute(text("SELECT filename FROM studio_queue_items;")).fetchall()
         existing_fnames = {str(r[0]) for r in existing_fnames_res if r[0]}
         max_order_res = conn.execute(text("SELECT COALESCE(MAX(order_index), -1) FROM studio_queue_items;")).scalar()
         next_order = int(max_order_res if max_order_res is not None else -1) + 1
 
-        for tid, fname in completed_rows:
+        for fname, tid in candidate_map.items():
             if fname and fname not in existing_fnames:
                 qid = f"studio_requeue_{tid[:8]}"
                 conn.execute(text("""
                     INSERT INTO studio_queue_items (id, filename, size, status, upload_progress, task_id, error, order_index, client_id, updated_at)
                     VALUES (:id, :filename, 0, 'WAITING', 0, NULL, NULL, :order_index, 'server', CURRENT_TIMESTAMP)
-                    ON CONFLICT (id) DO NOTHING;
+                    ON CONFLICT (id) DO UPDATE SET status = 'WAITING', task_id = NULL, error = NULL;
                 """), {"id": qid, "filename": fname, "order_index": next_order})
                 existing_fnames.add(fname)
                 next_order += 1
 
-        # 5. Delete completed studio tasks from completed_tasks and transm_tasks
+        # 6. Delete old records from completed_tasks and transm_tasks to prevent stale completion state
         conn.execute(text("DELETE FROM completed_tasks WHERE task_type = 'studio' OR task_type IS NULL;"))
         if purged_task_ids:
             purged_list = list(purged_task_ids)
@@ -936,34 +955,21 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
             params = {f"id_{i}": tid for i, tid in enumerate(purged_list)}
             in_clause = ",".join(placeholders)
             conn.execute(text(f"DELETE FROM transm_tasks WHERE task_id IN ({in_clause});"), params)
-        if not reset_processing:
-            conn.execute(text("DELETE FROM transm_tasks WHERE status IN ('COMPLETED', 'FAILED') AND LOWER(filename) NOT LIKE '%.srt';"))
-        else:
-            conn.execute(text("DELETE FROM transm_tasks WHERE LOWER(filename) NOT LIKE '%.srt';"))
+        conn.execute(text("DELETE FROM transm_tasks WHERE LOWER(filename) NOT LIKE '%.srt';"))
 
-        # 6. Reset studio_queue_items back to WAITING
-        if reset_processing:
-            upd = conn.execute(text("""
-                UPDATE studio_queue_items
-                SET status = 'WAITING',
-                    upload_progress = 0,
-                    task_id = NULL,
-                    error = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE status != 'WAITING' OR task_id IS NOT NULL;
-            """))
-            requeued_count = upd.rowcount
-        else:
-            upd = conn.execute(text("""
-                UPDATE studio_queue_items
-                SET status = 'WAITING',
-                    upload_progress = 0,
-                    task_id = NULL,
-                    error = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE status IN ('COMPLETED', 'FAILED');
-            """))
-            requeued_count = upd.rowcount
+        # 7. Reset ALL studio_queue_items back to WAITING
+        conn.execute(text("""
+            UPDATE studio_queue_items
+            SET status = 'WAITING',
+                upload_progress = 0,
+                task_id = NULL,
+                error = NULL,
+                updated_at = CURRENT_TIMESTAMP;
+        """))
+
+        # 8. Count total waiting items
+        total_waiting = conn.execute(text("SELECT count(*) FROM studio_queue_items WHERE status = 'WAITING';")).scalar()
+        requeued_count = int(total_waiting or 0)
 
     logger.info(f"Re-queued {requeued_count} studio tasks back to WAITING (purged {len(purged_task_ids)} old task records).")
     return {
