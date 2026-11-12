@@ -707,7 +707,9 @@ def refine_subtitles_with_llm(
             logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement and keeping raw STT text.")
             return segments
     else:
-        logger.info(f"Refining subtitles using Cloud LLM Provider: [{provider}]")
+        settings = get_runtime_settings()
+        active_model = settings.get(f"{provider}_model") or provider
+        logger.info(f"Refining subtitles using Cloud LLM Provider: [{provider}], model: [{active_model}]")
 
     # Load Proper Noun Dictionary
     try:
@@ -801,14 +803,17 @@ def refine_subtitles_with_llm(
             if progress_callback:
                 progress_callback(current_batch_num, total_batches)
 
-    # Final Verification Pass: Ensure ZERO untranslated foreign segments
+    # Final Verification Pass: Ensure ZERO untranslated foreign segments and dictionary accuracy
     untranslated_count = 0
     for seg in segments:
         raw = seg.get("raw_text", "")
         ref = seg.get("refined_text", "")
+        if dict_map and ref:
+            ref = apply_dictionary_postprocess(raw, ref, dict_map)
+            seg["refined_text"] = ref
         if not is_valid_korean_result(raw, ref):
             untranslated_count += 1
-            fixed = refine_single_segment_fallback(client, seg["index"], raw)
+            fixed = refine_single_segment_fallback(client, seg["index"], raw, dict_map)
             seg["refined_text"] = fixed
             checkpoint_map[seg["index"]] = fixed
 

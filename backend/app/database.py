@@ -147,7 +147,21 @@ def get_engine() -> Engine:
             last_error = e
             logger.warning(f"Could not connect to PostgreSQL database '{candidate_db}': {e}")
 
-    raise RuntimeError(f"Failed to connect to any PostgreSQL database ({db_candidates}): {last_error}")
+    logger.error(
+        f"PostgreSQL connection to {POSTGRES_HOST}:{POSTGRES_PORT} failed ({last_error}). "
+        f"Falling back gracefully to local SQLite database: {SQLITE_PATH}"
+    )
+    _is_sqlite = True
+    sqlite_file = Path(SQLITE_PATH).resolve()
+    sqlite_file.parent.mkdir(parents=True, exist_ok=True)
+    db_url = f"sqlite:///{sqlite_file.as_posix()}"
+    _engine = create_engine(
+        db_url,
+        connect_args={"check_same_thread": False},
+    )
+    _configure_sqlite_pragma(_engine)
+    _connected_db_name = str(sqlite_file)
+    return _engine
 
 
 def init_db():

@@ -27,6 +27,8 @@ from app.config import (
     get_runtime_settings,
     update_runtime_settings,
     get_ollama_model,
+    get_active_llm_config,
+    get_active_llm_provider,
     get_whisper_config,
     get_media_scan_dirs
 )
@@ -398,8 +400,10 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
             return
 
         # Step 3: LLM Context Refinement (with PostgreSQL batch checkpointing)
-        active_llm = get_ollama_model()
-        tasks[task_id].stage = f"Ollama ({active_llm}) 모델로 문맥 교정 준비 중..."
+        active_cfg = get_active_llm_config()
+        active_prov = active_cfg.get("provider", "ollama")
+        active_model_name = active_cfg.get("model", "gemma4:12b")
+        tasks[task_id].stage = f"{active_prov.upper()} ({active_model_name}) 모델로 문맥 교정 준비 중..."
         tasks[task_id].progress = 55
         save_task_state(task_id)
 
@@ -421,8 +425,10 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
         def on_refine_progress(current_batch: int, total_batches: int):
             percent = 55 + int((current_batch / total_batches) * 35)
             tasks[task_id].progress = min(percent, 89)
-            cur_llm = get_ollama_model()
-            tasks[task_id].stage = f"Ollama ({cur_llm}) 자막 교정 중... ({current_batch}/{total_batches} 완료)"
+            cfg = get_active_llm_config()
+            cur_prov = cfg.get("provider", "ollama")
+            cur_llm = cfg.get("model", "gemma4:12b")
+            tasks[task_id].stage = f"{cur_prov.upper()} ({cur_llm}) 자막 교정 중... ({current_batch}/{total_batches} 완료)"
             save_task_state(task_id)
 
         refined_segments = refine_subtitles_with_llm(
@@ -468,6 +474,14 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
         save_task_state(task_id)
         db.delete_studio_queue_by_task_id(task_id, filename=filename)
         logger.info(f"Task {task_id} completed successfully, saved to PostgreSQL, and removed from studio queue.")
+
+        # Clean up temporary audio file to preserve disk space
+        try:
+            if audio_path.exists():
+                audio_path.unlink(missing_ok=True)
+                logger.info(f"Temporary audio file cleaned up: {audio_path}")
+        except Exception as e_clean:
+            logger.warning(f"Could not clean up temporary audio {audio_path}: {e_clean}")
 
         # Check and auto-start next queued item immediately
         try:
@@ -672,17 +686,17 @@ async def update_subtitles(task_id: str, payload: UpdateSubtitlesRequest):
     
     task = tasks[task_id]
 
-    # Re-generate SRT file with new subtitles, optimizing end-times
+    # Re-generate SRT file with new subtitles (preserve user-edited timings without duplicate +0.3s extension)
     raw_segments_dict = [sub.model_dump() for sub in payload.subtitles]
     clean_segments = [s for s in raw_segments_dict if (s.get("refined_text") or s.get("text") or s.get("raw_text") or "").strip()]
     if clean_segments:
-        segments_dict = optimize_subtitle_timing(clean_segments)
+        segments_dict = optimize_subtitle_timing(clean_segments, extend_sec=0.0)
     else:
         segments_dict = []
     task.subtitles = [SubtitleSegment(**seg) for seg in segments_dict]
     
     srt_path = PROCESSED_DIR / f"{task_id}.srt"
-    generate_srt_file(segments_dict, srt_path)
+    generate_srt_file(segments_dict, srt_path, optimize=False)
     task_srt_paths[task_id] = srt_path
 
     # Persist updated subtitles to PostgreSQL
@@ -1104,7 +1118,10 @@ def run_translation_pipeline(
     """Background worker executing translation of subtitle segments."""
     try:
         target_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
-        tasks[trans_task_id].stage = f"Ollama gemma4:12b로 {target_name} 번역 준비 중..."
+        active_cfg = get_active_llm_config()
+        prov_name = active_cfg.get("provider", "ollama").upper()
+        model_name = active_cfg.get("model", "gemma4:12b")
+        tasks[trans_task_id].stage = f"{prov_name} ({model_name}) 모델로 {target_name} 번역 준비 중..."
         tasks[trans_task_id].progress = 10
         save_task_state(trans_task_id)
 
@@ -1124,7 +1141,10 @@ def run_translation_pipeline(
         def on_trans_progress(current_batch: int, total_batches: int):
             pct = 10 + int((current_batch / total_batches) * 80)
             tasks[trans_task_id].progress = min(pct, 95)
-            tasks[trans_task_id].stage = f"자막 {target_name} 번역 중... ({current_batch}/{total_batches} 완료)"
+            cfg = get_active_llm_config()
+            cur_prov = cfg.get("provider", "ollama").upper()
+            cur_model = cfg.get("model", "gemma4:12b")
+            tasks[trans_task_id].stage = f"{cur_prov} ({cur_model}) 자막 {target_name} 번역 중... ({current_batch}/{total_batches} 완료)"
             save_task_state(trans_task_id)
 
         def on_checkpoint(cp_map):
@@ -2313,9 +2333,10 @@ async def update_system_settings_endpoint(
 
 @router.post("/settings/test-cloud-llm")
 async def test_cloud_llm_endpoint(payload: CloudLLMTestRequest):
-    """Tests connectivity with designated provider (OpenAI, Anthropic, Gemini, Ollama)."""
+    """Tests connectivity with designated provider (OpenAI, Anthropic, Gemini, Ollama) without blocking event loop."""
     from app.services.llm_provider import test_provider_connectivity
-    res = test_provider_connectivity(
+    res = await run_in_threadpool(
+        test_provider_connectivity,
         provider=payload.provider,
         api_key=payload.api_key,
         model=payload.model
@@ -2325,14 +2346,14 @@ async def test_cloud_llm_endpoint(payload: CloudLLMTestRequest):
 
 @router.post("/settings/pull-model")
 async def pull_ollama_model_endpoint(payload: PullModelRequest):
-    """Downloads/pulls a model from Ollama registry if not yet installed."""
+    """Downloads/pulls a model from Ollama registry in threadpool to prevent freezing FastAPI event loop."""
     model_name = payload.model_name.strip()
     if not model_name:
         raise HTTPException(status_code=400, detail="모델 이름을 입력해 주세요.")
     try:
         logger.info(f"Pulling Ollama model: {model_name}...")
         client = ollama.Client(host=OLLAMA_HOST)
-        client.pull(model_name)
+        await run_in_threadpool(client.pull, model_name)
         logger.info(f"Successfully pulled Ollama model: {model_name}")
         return {
             "success": True,

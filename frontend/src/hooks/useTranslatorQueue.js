@@ -6,6 +6,12 @@ const MAX_BATCH_SIZE = 10;
 
 export function useTranslatorQueue({ onTaskCompleted }) {
   const [queue, setQueue] = useState([]);
+  const queueRef = useRef([]);
+  queueRef.current = queue;
+
+  const onTaskCompletedRef = useRef(onTaskCompleted);
+  onTaskCompletedRef.current = onTaskCompleted;
+
   const isStartingRef = useRef(false);
 
   // Add multiple SRT files (Max 10 per batch)
@@ -89,7 +95,8 @@ export function useTranslatorQueue({ onTaskCompleted }) {
     let timerId = null;
 
     const processQueue = async () => {
-      const activeItem = queue.find((it) => it.status === 'STARTING' || it.status === 'PROCESSING');
+      const currentQueue = queueRef.current;
+      const activeItem = currentQueue.find((it) => it.status === 'STARTING' || it.status === 'PROCESSING');
 
       // 1. If an item is processing, poll status
       if (activeItem && activeItem.status === 'PROCESSING' && activeItem.taskId) {
@@ -113,8 +120,8 @@ export function useTranslatorQueue({ onTaskCompleted }) {
             )
           );
 
-          if (statusData.status === 'COMPLETED' && onTaskCompleted) {
-            onTaskCompleted(statusData);
+          if (statusData.status === 'COMPLETED' && onTaskCompletedRef.current) {
+            onTaskCompletedRef.current(statusData);
           }
         } catch (err) {
           // Continue polling
@@ -124,7 +131,7 @@ export function useTranslatorQueue({ onTaskCompleted }) {
 
       // 2. If nothing is starting/processing, start next WAITING item
       if (!activeItem && !isStartingRef.current) {
-        const nextItem = queue.find((it) => it.status === 'WAITING');
+        const nextItem = currentQueue.find((it) => it.status === 'WAITING');
         if (nextItem) {
           isStartingRef.current = true;
           setQueue((prev) =>
@@ -174,7 +181,7 @@ export function useTranslatorQueue({ onTaskCompleted }) {
     return () => {
       if (timerId) clearInterval(timerId);
     };
-  }, [queue, onTaskCompleted]);
+  }, []);
 
   const activeItem = queue.find((it) => it.status === 'STARTING' || it.status === 'PROCESSING') || null;
   const waitingCount = queue.filter((it) => it.status === 'WAITING').length;

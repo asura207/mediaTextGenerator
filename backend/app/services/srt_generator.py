@@ -65,9 +65,12 @@ def optimize_subtitle_timing(
         if not text:
             continue
         st = max(0.0, float(s.get("start", 0.0)))
-        # Apply +0.3s extension to original end
         raw_ed = float(s.get("end", st + 1.2))
-        ed = max(st + 0.35, raw_ed + extend_sec)
+        # Prevent duplicate timing extension if already optimized or extend_sec is 0
+        if s.get("_timing_optimized") or extend_sec == 0.0:
+            ed = max(st + 0.35, raw_ed)
+        else:
+            ed = max(st + 0.35, raw_ed + extend_sec)
         raw_list.append({
             "start": round(st, 3),
             "end": round(ed, 3),
@@ -192,12 +195,13 @@ def optimize_subtitle_timing(
             "end_time_str": end_str,
             "text": txt,
             "refined_text": txt,
-            "raw_text": txt
+            "raw_text": txt,
+            "_timing_optimized": True
         })
 
     return optimized
 
-def generate_srt_file(segments: List[Dict[str, Any]], output_srt_path: Path) -> Path:
+def generate_srt_file(segments: List[Dict[str, Any]], output_srt_path: Path, optimize: bool = True) -> Path:
     """
     Generates a standard .srt file from segments using pysrt,
     saving in UTF-8 with BOM (utf-8-sig) and strict chronological ordering
@@ -205,7 +209,10 @@ def generate_srt_file(segments: List[Dict[str, Any]], output_srt_path: Path) -> 
     """
     logger.info(f"Generating SRT file at: {output_srt_path}")
     output_srt_path.parent.mkdir(parents=True, exist_ok=True)
-    optimized_segments = optimize_subtitle_timing(segments)
+    if optimize and not all(seg.get("_timing_optimized") for seg in segments):
+        optimized_segments = optimize_subtitle_timing(segments)
+    else:
+        optimized_segments = segments
     subs = pysrt.SubRipFile()
     
     for i, seg in enumerate(optimized_segments, start=1):
