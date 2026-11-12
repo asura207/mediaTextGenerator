@@ -266,5 +266,59 @@ export const addFolderToStudioQueue = async (folderPath, clientId = null) => {
   return response.data;
 };
 
+// ==============================================================================
+// Multi-Cloud LLM Connectivity Test API
+// ==============================================================================
+
+export const testCloudLLM = async ({ provider, apiKey = '', model = '' }) => {
+  const response = await api.post('/settings/test-cloud-llm', {
+    provider,
+    api_key: apiKey,
+    model,
+  });
+  return response.data;
+};
+
+// ==============================================================================
+// Proper Noun Dictionary API (고유명사 사전)
+// ==============================================================================
+
+export const getDictionaryEntries = async (page = 1, size = 50, query = '') => {
+  const params = { page, size };
+  if (query && query.trim()) {
+    params.query = query.trim();
+  }
+  const response = await api.get('/dictionary', { params });
+  return response.data;
+};
+
+export const addDictionaryEntry = async ({ source_word, target_word, notes = '' }) => {
+  const response = await api.post('/dictionary', {
+    source_word,
+    target_word,
+    notes,
+  });
+  return response.data;
+};
+
+export const updateDictionaryEntry = async (entryId, { source_word, target_word, notes = '' }) => {
+  const response = await api.put(`/dictionary/${entryId}`, {
+    source_word,
+    target_word,
+    notes,
+  });
+  return response.data;
+};
+
+export const deleteDictionaryEntry = async (entryId) => {
+  const response = await api.delete(`/dictionary/${entryId}`);
+  return response.data;
+};
+
+export const batchDeleteDictionaryEntries = async (ids) => {
+  const response = await api.post('/dictionary/batch-delete', { ids });
+  return response.data;
+};
+
 export default api;
 

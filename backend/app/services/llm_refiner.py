@@ -5,7 +5,15 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 import ollama
-from app.config import OLLAMA_HOST, get_ollama_model, get_llm_batch_size
+from app.config import (
+    OLLAMA_HOST,
+    get_ollama_model,
+    get_llm_batch_size,
+    get_active_llm_provider,
+    get_runtime_settings,
+)
+from app.database import get_all_dictionary_map
+from app.services.llm_provider import chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -355,46 +363,60 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
 
     return fast_translate_short(raw_s) or "..."
 
-SYSTEM_PROMPT = """당신은 영상 자막 전문 에디터이자 한국어 문맥 교정 및 대화체 번역 전문가입니다.
+def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict[str, str]) -> str:
+    """Ensures registered proper nouns are accurately mapped into the refined text."""
+    if not orig_text or not trans_text or not dict_map:
+        return trans_text
+    res = trans_text
+    for src, tgt in dict_map.items():
+        if src in orig_text and src in res:
+            res = res.replace(src, tgt)
+    return res
+
+
+def build_refiner_dict_section(batch_segments: List[Dict[str, Any]], dict_map: Dict[str, str]) -> str:
+    """Builds [고유명사 사전] section for matched terms in the batch."""
+    if not dict_map:
+        return ""
+    matched: Dict[str, str] = {}
+    for s in batch_segments:
+        txt = str(s.get("raw_text") or s.get("text") or "")
+        for src, tgt in dict_map.items():
+            if src in txt:
+                matched[src] = tgt
+    if not matched:
+        return ""
+    lines = ["\n[고유명사 사전 (원문 -> 한국어 지정 번역 단어)]"]
+    for src, tgt in matched.items():
+        lines.append(f"- {src} -> {tgt}")
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = """당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 영상 번역가이자 한국어 자막 교정 전문가입니다.
 Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전달받게 됩니다.
-각 세그먼트의 문맥과 상황을 파악하여 다음 지침에 따라 실제 방송/영화/유튜브 영상처럼 자연스러운 구어체로 교정 및 번역해 주세요:
+원래의 의미, 감정선, 캐릭터의 성격, 그리고 말투를 그대로 살려 실제 방송/영화/애니메이션처럼 자연스럽고 유창한 한국어 구어체로 교정 및 번역해 주세요.
 
-[핵심 지침: 자연스러운 일상 구어체(대화체) 원칙]
-1. **사전식 직역투 및 딱딱한 문어체 절대 금지**:
-   - 사전이나 책을 읽는 듯한 딱딱하고 어색한 문어체(~하는 것이다, ~에 있어서, ~라 볼 수 있다, ~하기 마련이다, ~하기를 희망한다 등)는 절대 사용하지 마세요.
-   - 실제 사람이 일상에서 자연스럽게 대화하듯, 또는 전문 방송/영화/유튜브 자막처럼 유려하고 생생한 **구어체(대화체)**로 윤문 및 의역하세요.
-   - 번역투 3인칭 대명사('그는', '그녀는', '그것은' 등)의 불필요한 남발을 피하고 한국어 대화 흐름에 맞게 생략하거나 자연스럽게 바꾸세요 (예: '그것은' → '그건', '이것은' → '이건', '그는' → 주어 생략 또는 인물 이름/그 사람).
-   - 종결 어미를 사전체가 아닌 자연스러운 일상 대화체로 표현하세요:
-     * 존댓말인 경우: '~할 예정입니다' → '~할 거예요', '~하지 않습니다' → '~안 해요' / '~하지 않아요', '~했나요?', '~거든요', '~인 것 같아요', '~해 보세요' 등 부드러운 구어체 어미 활용.
-     * 반말/친근한 대화인 경우: 문맥에 맞게 '~했어', '~잖아', '~거야', '~는데?', '~지?' 등 자연스러운 일상 어미 활용.
-
-2. **외국어(일본어 가나/한자, 중국어 한자, 영어 등) 100% 순수 한글 번역 필수**:
-   - 원문이 외국어인 경우 원문 글자(일본어 히라가나/가타카나, 한자, 중국어 등)를 단 한 글자도 남기거나 섞어 쓰지 말고 **100% 순수 한국어(한글)**로 번역하세요.
-   - 절대로 일본어와 한글을 섞어 쓰거나(예: 'ちゃんと 잘해' 금지 -> '제대로 잘해'), 중국어 한자(예: '算了' 금지 -> '됐어')를 출력하지 마세요.
-
-3. **한국어 음성인식(STT) 교정 규칙**:
-   - 원문이 이미 한국어인 경우, 음성인식 과정에서 발생하는 오탈자, 유사 발음 오인식 단어, 띄어쓰기, 맞춤법을 구어체 대화 맥락에 맞게 교정하세요.
-   - 말이 이어지는 자연스러운 말버릇이나 추임새는 자막 가독성을 해치지 않는 선에서 자연스럽게 정돈하세요.
-
-4. **고유명사 및 문맥 어조 일관성**:
-   - 인물, 제품, 지명, 전문 용어가 오인식된 경우 문맥상 올바른 표기로 바로잡으세요.
-   - 화자들의 관계와 상황에 맞는 일관된 말투(존댓말/반말)를 유지하세요.
-
+[핵심 번역 및 교정 지침]
+1. **인명 번역 금지 및 고유명사 일관성**:
+   - 캐릭터 이름이나 인명은 번역하거나 다른 단어로 의역하지 말고 원문 의미/발음 표기를 그대로 유지하세요(단, 고유명사 사전에 등록된 경우는 사전 표기를 따름).
+2. **고유명사 사전 최우선 적용**:
+   - 함께 제공되는 [고유명사 사전]에 등록된 원문 단어가 대사에 등장할 경우, 반드시 사전에 지정된 '번역 단어'를 최우선으로 사용해 주세요.
+3. **자연스러운 일상 구어체(대화체) 원칙**:
+   - 사전이나 책을 읽는 듯한 딱딱하고 어색한 문어체(~하는 것이다, ~에 있어서 등)는 절대 사용하지 마세요.
+   - 실제 사람이 일상에서 자연스럽게 대화하듯 유려하고 생생한 구어체(대화체)로 번역 및 의역하세요.
+   - 번역투 3인칭 대명사('그는', '그녀는', '그것은' 등)는 생략하거나 자연스러운 대화체로 바꾸세요.
+4. **외국어(일본어 가나/한자, 중국어 한자 등) 100% 순수 한글 번역 필수**:
+   - 원문에 남아있는 일본어 히라가나/가타카나, 한자, 중국어를 단 한 글자도 남기지 말고 100% 순수 한국어(한글)로 번역하세요.
 5. **감탄사, 비명, 신음, 숨소리 100% 보존 원칙 (절대 누락/삭제 금지)**:
-   - 등장인물의 감탄사, 비명, 신음, 헐떡임, 놀람, 당황, 흐느낌 등 비언어적/정서적 발화(예: 'あっ', 'あぁ', 'うっ', 'んっ', 'きゃあ', 'はぁ…', 'いや…', '痛い', 'ダメ', 'すごい', 'やめて' 등)는 영상의 극적인 감정과 현장감을 전달하는 핵심 자막입니다.
-   - **절대로 이러한 발화를 무시하거나 삭제하거나 생략하지 마세요.**
-   - 원문의 어조와 상황에 가장 알맞은 생생한 한국어 감탄사/의성어(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...', '싫어...', '아파!', '안 돼...', '대단해...')로 반드시 1:1 대응하여 온전히 살려두세요.
-
-6. **절대 규칙**:
-   - 전달받은 세그먼트의 번호(id)와 개수를 반드시 정확히 1:1로 유지해야 합니다. 
-   - 타임스탬프와 동기화되어 있으므로 세그먼트를 임의로 합치거나 분리하거나 삭제하지 마세요.
+   - 등장인물의 감탄사, 비명, 신음, 헐떡임, 놀람, 당황, 흐느낌 등 비언어적/정서적 발화(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...' 등)는 절대 생략하거나 삭제하지 말고 1:1로 온전히 살려두세요.
+6. **세그먼트 1:1 유지**:
+   - 전달받은 세그먼트의 번호(id)와 개수를 반드시 정확히 1:1로 유지해야 합니다. 임의로 합치거나 분리하거나 삭제하지 마세요.
 
 [출력 형식]
-반드시 아래와 같은 JSON 객체 형식으로만 응답하세요. 다른 설명이나 인사말은 일체 포함하지 마세요.
+반드시 아래와 같은 JSON 객체 형식으로만 응답하세요. 다른 설명이나 인사말은 일체 포함하지 마세요:
 {
   "subtitles": [
-    {"id": 1, "text": "자연스러운 구어체로 다듬어진 자막 문장"},
-    {"id": 2, "text": "자연스러운 구어체로 다듬어진 자막 문장"}
+    {"id": 1, "text": "자연스러운 구어체 한국어 자막 문장"}
   ]
 }
 """
@@ -522,102 +544,122 @@ def extract_subtitles_via_regex(raw_text: str) -> Dict[int, str]:
                 pass
     return results
 
-def refine_single_segment_fallback(client: ollama.Client, seg_id: int, raw_text: str) -> str:
-    """Ultra-reliable single-line translation/refinement fallback with JSON enforcement and strict sanitization."""
+def refine_single_segment_fallback(
+    client: Optional[ollama.Client],
+    seg_id: int,
+    raw_text: str,
+    dict_map: Optional[Dict[str, str]] = None
+) -> str:
+    """Ultra-reliable single-line translation/refinement fallback with Senior persona and dictionary lookup."""
     if not raw_text or not str(raw_text).strip():
         return "..."
     raw_clean = str(raw_text).strip()
     fast_hit = fast_translate_short(raw_clean)
     if fast_hit:
+        if dict_map:
+            fast_hit = apply_dictionary_postprocess(raw_clean, fast_hit, dict_map)
         return fast_hit
 
-    active_model = resolve_active_ollama_model(client)
-    prompt = json.dumps({"id": seg_id, "text": raw_clean}, ensure_ascii=False)
+    dict_map = dict_map or {}
+    dict_section = build_refiner_dict_section([{"text": raw_clean}], dict_map)
+    system_prompt = (
+        "당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 번역가입니다. "
+        "입력된 자막을 자연스러운 한국어 구어체 한 문장으로 번역 및 교정하여 "
+        '반드시 {"text": "번역된 한국어 자막"} 형식의 JSON으로만 응답하세요. '
+        "인명은 원문 발음대로 보존하고 고유명사 사전을 최우선 적용하세요. "
+        f"{dict_section}\n부연 설명이나 전각 기호를 절대 포함하지 마세요."
+    )
+    user_prompt = json.dumps({"id": seg_id, "text": raw_clean}, ensure_ascii=False)
+
     for attempt in range(2):
         try:
-            resp = client.chat(
-                model=active_model,
+            content = chat_completion(
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "당신은 영상 자막 번역기입니다. 입력된 자막을 자연스러운 한국어 구어체 한 문장으로 번역하여 "
-                            '반드시 {"text": "번역된 한국어 자막"} 형식의 JSON으로만 응답하세요. '
-                            "절대로 부연 설명이나 여러 후보를 나열하거나 질문하지 마세요. "
-                            "일본어 가나/한자, 중국어 한자, 전각 기호(。，：“”)를 절대 포함하지 마세요."
-                        )
-                    },
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
                 ],
-                format="json",
-                think=False,
-                options={"temperature": 0.15 if attempt == 0 else 0.3, "num_predict": 128, "repeat_penalty": 1.15, "num_ctx": 2048}
+                temperature=0.15 if attempt == 0 else 0.3,
+                format_json=True,
+                max_tokens=256,
+                timeout=45.0
             )
-            content = resp["message"]["content"].strip()
             candidate = ""
             try:
                 parsed = json.loads(clean_json_response(content))
                 if isinstance(parsed, dict):
                     candidate = str(parsed.get("text") or parsed.get("korean") or parsed.get("translation") or "").strip()
             except Exception:
-                candidate = content
+                candidate = content.strip()
 
             sanitized = sanitize_subtitle_text(raw_clean, candidate)
+            if dict_map:
+                sanitized = apply_dictionary_postprocess(raw_clean, sanitized, dict_map)
             if sanitized and is_valid_korean_result(raw_clean, sanitized):
                 return sanitized
         except Exception as e:
             logger.warning(f"Single segment refinement failed for #{seg_id} (attempt {attempt + 1}): {e}")
-    return fast_translate_short(raw_clean) or "..."
 
-def refine_subtitles_batch(client: ollama.Client, batch_segments: List[Dict[str, Any]]) -> Dict[int, str]:
-    """Refines a single batch of segments via Ollama with validation and sanitization."""
-    active_model = resolve_active_ollama_model(client)
+    fb = fast_translate_short(raw_clean) or "..."
+    if fb and dict_map:
+        fb = apply_dictionary_postprocess(raw_clean, fb, dict_map)
+    return fb
+
+def refine_subtitles_batch(
+    client: Optional[ollama.Client],
+    batch_segments: List[Dict[str, Any]],
+    dict_map: Optional[Dict[str, str]] = None
+) -> Dict[int, str]:
+    """Refines a single batch of segments via unified LLM router with Senior persona and dictionary injection."""
     input_payload = [{"id": s["index"], "text": s["raw_text"]} for s in batch_segments]
-    user_prompt = f"다음 자막 세그먼트들을 사전식 문어체가 아닌 실제 사람이 대화하는 생생하고 자연스러운 구어체 한국어로 번역 및 교정해 주세요. 일본어 가나/한자 및 중국어 한자를 한 글자도 남기지 말고 반드시 100% 순수 한글로만 번역해야 합니다:\n{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
+    dict_map = dict_map or {}
+    dict_section = build_refiner_dict_section(batch_segments, dict_map)
 
-    response = client.chat(
-        model=active_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
-        think=False,
-        options={
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "repeat_penalty": 1.15,
-            "num_predict": 1024,
-            "num_ctx": 2048
-        }
-    )
+    full_system = SYSTEM_PROMPT + (dict_section if dict_section else "")
+    user_prompt = f"다음 자막 세그먼트들을 자연스럽고 유창한 한국어 구어체로 교정 및 번역해 주세요:\n{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
 
-    response_text = response["message"]["content"]
-    cleaned_json = clean_json_response(response_text)
-    
+    try:
+        response_text = chat_completion(
+            messages=[
+                {"role": "system", "content": full_system},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2,
+            format_json=True,
+            max_tokens=1500,
+            timeout=75.0
+        )
+    except Exception as e:
+        logger.warning(f"Batch refinement chat completion failed: {e}. Falling back to single-segment processing.")
+        response_text = ""
+
     result_map = {}
-    if not cleaned_json:
-        result_map = extract_subtitles_via_regex(response_text)
-    else:
-        try:
-            parsed = json.loads(cleaned_json)
-            result_map = extract_translations_from_parsed(parsed)
-        except Exception as e:
-            logger.warning(f"Could not parse LLM JSON batch: {e}. Attempting regex fallback.")
+    if response_text:
+        cleaned_json = clean_json_response(response_text)
+        if not cleaned_json:
             result_map = extract_subtitles_via_regex(response_text)
+        else:
+            try:
+                parsed = json.loads(cleaned_json)
+                result_map = extract_translations_from_parsed(parsed)
+            except Exception as e:
+                logger.warning(f"Could not parse LLM JSON batch: {e}. Attempting regex fallback.")
+                result_map = extract_subtitles_via_regex(response_text)
 
     # Validate & sanitize results: if invalid or meta-response, retry individually
     for seg in batch_segments:
         sid = seg["index"]
         raw = seg.get("raw_text", "")
-        if sid in result_map:
+        if sid in result_map and result_map[sid]:
             trans = sanitize_subtitle_text(raw, result_map[sid])
+            if dict_map:
+                trans = apply_dictionary_postprocess(raw, trans, dict_map)
             if is_valid_korean_result(raw, trans):
                 result_map[sid] = trans
             else:
                 logger.info(f"Segment #{sid} returned invalid/untranslated text '{result_map[sid]}'. Retrying individually.")
-                result_map[sid] = refine_single_segment_fallback(client, sid, raw)
+                result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map)
         else:
-            result_map[sid] = refine_single_segment_fallback(client, sid, raw)
+            result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map)
 
     return result_map
 
@@ -643,9 +685,9 @@ def refine_subtitles_with_llm(
     checkpoint_path: Optional[Path] = None
 ) -> List[Dict[str, Any]]:
     """
-    Refines all subtitle segments using Ollama LLM in batches.
+    Refines all subtitle segments using unified LLM (Ollama or Cloud GPT/Claude/Gemini) in batches.
     Maintains a database/disk checkpoint for crash recovery and instant resume.
-    Ensures 100% Korean translation with zero untranslated foreign lines.
+    Ensures 100% Korean translation with zero untranslated foreign lines and dictionary accuracy.
     """
     if not segments:
         return segments
@@ -653,15 +695,26 @@ def refine_subtitles_with_llm(
     if not batch_size:
         batch_size = get_llm_batch_size()
 
+    provider = get_active_llm_provider()
+    client = None
+    if provider == "ollama":
+        try:
+            client = ollama.Client(host=OLLAMA_HOST, timeout=120.0)
+            client.list()
+            active_model = resolve_active_ollama_model(client)
+            logger.info(f"Connected to Ollama host: {OLLAMA_HOST}, active model: {active_model}")
+        except Exception as e:
+            logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement and keeping raw STT text.")
+            return segments
+    else:
+        logger.info(f"Refining subtitles using Cloud LLM Provider: [{provider}]")
+
+    # Load Proper Noun Dictionary
     try:
-        client = ollama.Client(host=OLLAMA_HOST, timeout=120.0)
-        # Probe connection to Ollama server early
-        client.list()
-        active_model = resolve_active_ollama_model(client)
-        logger.info(f"Connected to Ollama host: {OLLAMA_HOST}, active model: {active_model}")
+        dict_map = get_all_dictionary_map()
     except Exception as e:
-        logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement and keeping raw STT text.")
-        return segments
+        logger.warning(f"Could not load dictionary map: {e}")
+        dict_map = {}
 
     segments_by_id = {s["index"]: s for s in segments}
 
@@ -699,7 +752,7 @@ def refine_subtitles_with_llm(
             continue
 
         try:
-            refined_map = refine_subtitles_batch(client, batch)
+            refined_map = refine_subtitles_batch(client, batch, dict_map)
             for seg in batch:
                 seg_id = seg["index"]
                 if seg_id in refined_map and refined_map[seg_id]:
@@ -710,7 +763,7 @@ def refine_subtitles_with_llm(
                     seg["refined_text"] = checkpoint_map[seg_id]
                 else:
                     # Single line fallback
-                    fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"])
+                    fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map)
                     seg["refined_text"] = fb
                     if is_valid_korean_result(seg["raw_text"], fb):
                         checkpoint_map[seg_id] = fb
@@ -741,7 +794,7 @@ def refine_subtitles_with_llm(
             logger.error(f"Error refining batch {current_batch_num}/{total_batches}: {e}. Retrying segments individually...")
             for seg in batch:
                 seg_id = seg["index"]
-                fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"])
+                fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map)
                 seg["refined_text"] = fb
                 if is_valid_korean_result(seg["raw_text"], fb):
                     checkpoint_map[seg_id] = fb

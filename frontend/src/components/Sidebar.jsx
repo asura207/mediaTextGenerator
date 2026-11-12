@@ -12,7 +12,8 @@ import {
   Bell,
   BellRing,
   BellOff,
-  Settings
+  Settings,
+  BookOpen
 } from 'lucide-react';
 import {
   getNotificationPermission,
@@ -218,7 +219,36 @@ export default function Sidebar({
           )}
         </button>
 
-        {/* 4. Admin & Engine Settings */}
+        {/* 4. Proper Noun Dictionary (고유명사 사전) */}
+        <button
+          type="button"
+          onClick={() => onTabChange && onTabChange('dictionary')}
+          className={`w-full flex items-center justify-between px-3.5 py-3 rounded-xl text-xs font-semibold transition-all ${
+            activeTab === 'dictionary'
+              ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-lg shadow-indigo-600/30'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800/70'
+          }`}
+        >
+          <div className="flex items-center space-x-3">
+            <BookOpen
+              className={`w-4 h-4 flex-shrink-0 ${
+                activeTab === 'dictionary' ? 'text-white' : 'text-amber-400'
+              }`}
+            />
+            <span>고유명사 사전</span>
+          </div>
+          <span
+            className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+              activeTab === 'dictionary'
+                ? 'bg-white/20 text-white'
+                : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+            }`}
+          >
+            사전
+          </span>
+        </button>
+
+        {/* 5. Admin & Engine Settings */}
         <button
           type="button"
           onClick={() => onTabChange && onTabChange('settings')}

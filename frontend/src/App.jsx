@@ -5,6 +5,7 @@ import VideoUploader from './components/VideoUploader';
 import CompletedList from './components/CompletedList';
 import SubtitleTranslator from './components/SubtitleTranslator';
 import AdminSettings from './components/AdminSettings';
+import ProperNounDictionary from './components/ProperNounDictionary';
 import { getCompletedTasks, getSystemSettings } from './api/client';
 import { useStudioQueue } from './hooks/useStudioQueue';
 import { useTranslatorQueue } from './hooks/useTranslatorQueue';
@@ -188,6 +189,11 @@ export default function App() {
                 setSystemSettings(newSettings);
               }}
             />
+          )}
+
+          {/* TAB 5: Proper Noun Dictionary (고유명사 사전) */}
+          {activeTab === 'dictionary' && (
+            <ProperNounDictionary />
           )}
 
           {/* TAB 3: Subtitle Creation Studio (Queue Dashboard & Deferred Upload) */}

@@ -60,3 +60,22 @@ class TaskStatus(BaseModel):
 class UpdateSubtitlesRequest(BaseModel):
     subtitles: List[SubtitleSegment]
 
+class DictionaryEntryCreate(BaseModel):
+    source_word: str
+    target_word: str
+    notes: Optional[str] = None
+
+class DictionaryEntryUpdate(BaseModel):
+    source_word: str
+    target_word: str
+    notes: Optional[str] = None
+
+class DictionaryBatchDelete(BaseModel):
+    ids: List[int]
+
+class CloudLLMTestRequest(BaseModel):
+    provider: str
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+

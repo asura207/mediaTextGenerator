@@ -99,20 +99,37 @@ TransM은 로컬 AI 모델(Whisper 음성인식 및 Ollama LLM)을 사용자 PC�
    - **오류 발생 시 자동 넘김 및 오류 복사**: 특정 영상 처리 실패 시 멈추지 않고 다음 대기 영상으로 자동 전환되며, 상세 오류를 클릭 한 번으로 복사 가능.
    - **완료 항목 자동 보관함 이동**: 자막 생성이 완료된 항목은 대기열에서 자동으로 정리되어 [작업 완료 보관함]으로 이동.
 
-2. **작업 완료 보관함 (Completed Archive)**
+2. **자막 타이밍 자동 최적화 & 화자 중첩 2줄 표시 (Subtitle Timing Engine)**
+   - **자막 종료 시점 +0.3초(300ms) 자동 연장**: 자막이 너무 빨리 사라져 가독성을 해치지 않도록 모든 발화 종료 시점을 여유롭게 연장.
+   - **화자 간 발화 중첩 2줄 동시 표시**: 두 화자의 대화가 겹치는 구간 발생 시 자막을 자르거나 덮어씌우지 않고, 중첩 구간을 `- 화자1 대사\n- 화자2 대사` 2줄 다이얼로그로 슬라이싱 및 병합하여 화면에 동시 노출.
+   - **50ms 트랜지션 갭 보장**: 네이버 시리즈온 플레이어, 팟플레이어 등 국내외 모든 플레이어에서 깜빡임이나 대사 씹힘이 발생하지 않도록 50ms 안전 간격 및 타임스탬프 역전 방어 보장.
+
+3. **20년 차 시니어 영상 번역가 페르소나 프롬프트 (Senior Translation Persona)**
+   - **베테랑 외국어 전문 시니어 영상·애니메이션 번역가 페르소나**: 단순 기계 번역투를 배제하고 원작의 감정선, 호흡, 말투를 100% 살린 유려한 대화체 번역 제공.
+   - **인명/캐릭터 이름 임의 번역 금지**: 인명과 캐릭터 고유 명칭은 원문 발음 및 표기를 철저히 보존.
+   - **비명/신음/호흡 발화 100% 보존**: 감탄사, 비명, 신음, 헐떡임 등 비언어적 정서 표현을 생략하지 않고 1:1 생생한 한국어로 대응.
+
+4. **멀티 클라우드 LLM (GPT, Claude, Gemini) 통합 연동 (Multi-Cloud LLM)**
+   - **로컬 Ollama뿐만 아니라 클라우드 최고 성능 모델 지원**:
+     - **OpenAI (GPT)**: `gpt-4o`, `gpt-4o-mini`, `o3-mini`, `gpt-4-turbo`
+     - **Anthropic (Claude)**: `claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, `claude-3-opus-latest`
+     - **Google (Gemini)**: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-1.5-pro`
+   - **관리자 설정 화면 실시간 연결 테스트 (Ping Test)**: API 키와 모델을 입력 후 즉시 지연 시간(latency ms) 및 정상 작동 여부를 원클릭 테스트 가능.
+
+5. **고유명사 사전 구축 및 50건 페이징 관리 (Proper Noun Dictionary)**
+   - **PostgreSQL / SQLite 호환 고유명사 사전 테이블 구축**.
+   - **페이지당 50건 단위 페이징 테이블**: 검색, 신규 단어 등록, 수정, 단건 삭제 및 다중 선택 일괄 삭제 완벽 지원.
+   - **번역 파이프라인 자동 매칭 & 후처리 치환**: 자막에 등장하는 고유명사를 사전에서 자동 탐색하여 LLM 프롬프트에 주입하고, 번역 후에도 누락되지 않도록 후처리 보장.
+
+6. **작업 완료 보관함 (Completed Archive)**
    - 완료 자막 영구 보관 (SQLite / PostgreSQL).
    - **100건 단위 페이징**: 대용량 작업(수백~수천 건)도 페이지당 100건씩 쾌적하게 조회 및 관리.
    - **일괄 다운로드**: 신규 미다운로드 자막만 선별하여 ZIP 다운로드 또는 전체 자막 일괄 압축 다운로드 지원.
    - **인라인 자막 편집기**: 영상 프리뷰와 자막 타임라인이 연동되어 실시간 수정 및 저장 가능.
 
-3. **SRT 자막 번역기 (Subtitle Translator)**
+7. **SRT 자막 번역기 (Subtitle Translator)**
    - 기존 완료된 자막 또는 신규 `.srt` 파일을 업로드하여 다국어(한국어, 영어, 일본어, 중국어 등)로 자동 번역.
-   - 언어 자동 감지 및 로컬 LLM을 통한 자연스러운 대화체 의역.
-
-4. **관리자 시스템 설정 (Admin Engine Settings)**
-   - 화면에서 로컬 LLM 모델 및 Whisper 모델, 배치 크기 실시간 변경 및 즉시 적용.
-   - 미설치된 Ollama 모델 원클릭 다운로드 기능 탑재.
-   - 현재 구동 중인 DB 엔진(SQLite vs PostgreSQL) 상태 실시간 모니터링.
+   - 언어 자동 감지 및 시니어 번역가 페르소나를 통한 고품질 대화체 의역.
 
 ---
 
@@ -135,12 +152,13 @@ transM/
 │   │   ├── services/
 │   │   │   ├── audio_extractor.py     # 오디오 분리 및 추출 (16kHz mono WAV)
 │   │   │   ├── whisper_stt.py        # faster-whisper 음성인식
-│   │   │   ├── llm_refiner.py        # LLM 구어체 문맥 교정 및 전각 기호 필터링
-│   │   │   ├── subtitle_translator.py# 자막 다국어 번역 서비스
+│   │   │   ├── llm_refiner.py        # LLM 구어체 문맥 교정 및 고유명사 사전 반영
+│   │   │   ├── llm_provider.py       # 멀티 클라우드 LLM(Ollama/OpenAI/Claude/Gemini) 통합 라우터
+│   │   │   ├── subtitle_translator.py# 20년 차 시니어 번역가 페르소나 다국어 번역 서비스
 │   │   │   ├── language_detector.py  # 자막 언어 자동 감지
-│   │   │   └── srt_generator.py      # SRT 생성, 50ms 갭 최적화, UTF-8-SIG 인코딩
+│   │   │   └── srt_generator.py      # SRT 생성, 종료+0.3s, 중첩 2줄 병합, 50ms 갭 최적화
 │   │   ├── config.py         # 환경 변수 로드 및 런타임 설정 (SQLite/Postgres 지원)
-│   │   ├── database.py       # SQLite / PostgreSQL 듀얼 DB 추상화 엔진
+│   │   ├── database.py       # SQLite / PostgreSQL 듀얼 DB (고유명사 사전 CRUD 포함)
 │   │   ├── models.py         # Pydantic 데이터 모델
 │   │   └── main.py           # FastAPI 앱 초기화 및 SPA 통합 정적 서빙
 │   ├── data/                 # 런타임 데이터 (SQLite transm.db, 업로드/처리 결과물)
@@ -148,8 +166,8 @@ transM/
 │   └── run.py                # 백엔드 Uvicorn 구동 스크립트
 └── frontend/
     ├── src/
-    │   ├── api/              # API 통신 클라이언트
-    │   ├── components/       # UI 컴포넌트 (Queue, Archive, Editor, Admin 등)
+    │   ├── api/              # API 통신 클라이언트 (고유명사 사전 및 클라우드 LLM 테스트 포함)
+    │   ├── components/       # UI 컴포넌트 (Queue, Archive, Editor, Admin, ProperNounDictionary)
     │   └── App.jsx           # 메인 레이아웃 및 탭 네비게이션
     ├── dist/                 # Vite 사전 빌드된 프론트엔드 (백엔드 포트 8000 단독 구동 가능)
     ├── package.json

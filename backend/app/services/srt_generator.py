@@ -20,87 +20,180 @@ def seconds_to_subrip_time(seconds: float) -> pysrt.SubRipTime:
     ms = max(0, int(round(float(seconds) * 1000)))
     return pysrt.SubRipTime.from_ordinal(ms)
 
-def optimize_subtitle_timing(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def format_dual_lines(text_a: str, text_b: str) -> str:
+    """Formats two overlapping speaker lines as standard dual-line dialog (- Line 1\n- Line 2)."""
+    a = str(text_a or "").strip()
+    b = str(text_b or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if a == b:
+        return a
+
+    lines = []
+    for txt in (a, b):
+        sub_lines = [l.strip() for l in txt.split("\n") if l.strip()]
+        for sl in sub_lines:
+            if sl.startswith(("-", "―", "—", "•", "·")):
+                lines.append(sl)
+            else:
+                lines.append(f"- {sl}")
+    return "\n".join(lines)
+
+
+def optimize_subtitle_timing(
+    segments: List[Dict[str, Any]],
+    extend_sec: float = 0.3,
+    min_gap: float = 0.05
+) -> List[Dict[str, Any]]:
     """
-    Optimizes subtitle segment start and end times so that:
-    1. Segments are strictly sorted in chronological order (start ASC), preventing timeline skips.
-    2. Subtitles disappear promptly when speech/dialogue finishes.
-    3. Subtitles never artificially linger across long pauses or musical interludes.
-    4. Each subtitle remains visible for an appropriate reading duration:
-       - Minimum duration: ~1.2s to 1.4s (ensures readability for short 1-word lines like '네', '고마워').
-       - Maximum duration: capped at ~5.5s to 6.0s (broadcast / Netflix standard).
-    5. Consecutive subtitles NEVER overlap; a clean 50ms transition gap is guaranteed
-       via forward-cascade timeline correction so strict players (Series On, TV, etc.) never drop subtitles.
-    6. Indices are re-sequenced cleanly from 1 to N without gaps.
+    Optimizes subtitle timings with:
+    1. [Requirement 1-1] End time extension (+0.3s / 300ms) for comfortable reading.
+    2. [Requirement 1-2] Speaker overlap resolution: Merges concurrent speech into 2-line subtitles (- Speaker 1\n- Speaker 2).
+    3. Strict 50ms transition gap between consecutive subtitles to prevent Series On / PotPlayer flickering/skips.
+    4. Guard against negative durations or inverted timestamps (start < end strictly guaranteed).
+    5. Clean re-sequencing of subtitle indices (1 to N).
     """
     if not segments:
         return []
 
-    # 1. Filter out empty or whitespace-only segments
-    valid_segments = []
+    # 1. Filter out empty segments and parse clean floats
+    raw_list = []
     for s in segments:
         text = str(s.get("refined_text") or s.get("text") or s.get("raw_text") or "").strip()
-        if text:
-            valid_segments.append(dict(s))
+        if not text:
+            continue
+        st = max(0.0, float(s.get("start", 0.0)))
+        # Apply +0.3s extension to original end
+        raw_ed = float(s.get("end", st + 1.2))
+        ed = max(st + 0.35, raw_ed + extend_sec)
+        raw_list.append({
+            "start": round(st, 3),
+            "end": round(ed, 3),
+            "text": text,
+            "orig": dict(s)
+        })
 
-    if not valid_segments:
+    if not raw_list:
         return []
 
-    # 2. Strictly sort by start time to prevent Series On Player timeline skip bugs!
-    valid_segments.sort(key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))))
+    # 2. Chronological sort by start time
+    raw_list.sort(key=lambda s: (s["start"], s["end"]))
 
-    num_segs = len(valid_segments)
+    # 3. Overlap resolution pass (Slices and merges overlapping speaker segments)
+    merged_items = []
+    i = 0
+    while i < len(raw_list):
+        curr = raw_list[i]
+        c_st = curr["start"]
+        c_ed = curr["end"]
+        c_tx = curr["text"]
+
+        if i + 1 < len(raw_list):
+            nxt = raw_list[i + 1]
+            n_st = nxt["start"]
+            n_ed = nxt["end"]
+            n_tx = nxt["text"]
+
+            # Check if current segment overlaps with next segment
+            if c_ed > n_st + min_gap:
+                overlap_st = n_st
+                overlap_ed = min(c_ed, n_ed)
+
+                # Part A: Pre-overlap solo speech (if long enough to read)
+                if overlap_st - c_st >= 0.35:
+                    merged_items.append({
+                        "start": c_st,
+                        "end": round(overlap_st - min_gap, 3),
+                        "text": c_tx
+                    })
+                elif overlap_st > c_st:
+                    # Very short prefix: shift overlap start earlier to avoid losing words
+                    overlap_st = c_st
+
+                # Part B: Concurrent dual-speaker speech (2 lines: - Line A\n- Line B)
+                if overlap_ed > overlap_st + 0.2:
+                    dual_text = format_dual_lines(c_tx, n_tx)
+                    merged_items.append({
+                        "start": round(overlap_st, 3),
+                        "end": round(overlap_ed, 3),
+                        "text": dual_text
+                    })
+
+                # Part C: Post-overlap trailing speech
+                if c_ed > n_ed + min_gap:
+                    # Current speaker kept talking after next speaker stopped
+                    raw_list[i + 1] = {
+                        "start": round(overlap_ed + min_gap, 3),
+                        "end": c_ed,
+                        "text": c_tx,
+                        "orig": curr.get("orig", {})
+                    }
+                    i += 1
+                    continue
+                elif n_ed > c_ed + min_gap:
+                    # Next speaker continues talking after current speaker stopped
+                    raw_list[i + 1] = {
+                        "start": round(overlap_ed + min_gap, 3),
+                        "end": n_ed,
+                        "text": n_tx,
+                        "orig": nxt.get("orig", {})
+                    }
+                    i += 1
+                    continue
+                else:
+                    # Both ended simultaneously
+                    i += 2
+                    continue
+
+        merged_items.append({
+            "start": round(c_st, 3),
+            "end": round(c_ed, 3),
+            "text": c_tx
+        })
+        i += 1
+
+    # 4. Final smoothing & 50ms gap enforcement pass
     optimized = []
+    last_end = -1.0
 
-    # 3. Forward cascade pass: guarantees zero overlap, >= 50ms transition gap, and readability duration
-    for i in range(num_segs):
-        seg = dict(valid_segments[i])
-        cur_start = max(0.0, float(seg.get("start", 0.0)))
-        raw_end = float(seg.get("end", cur_start + 1.5))
-        text = str(seg.get("refined_text") or seg.get("text") or seg.get("raw_text") or "").strip()
+    for idx, item in enumerate(merged_items):
+        st = max(0.0, float(item["start"]))
+        ed = max(st + 0.3, float(item["end"]))
+        txt = str(item["text"]).strip()
 
-        # Clean length without whitespace
-        clean_len = len(re.sub(r"\s+", "", text))
+        # Ensure minimum 50ms gap from previous subtitle
+        if st < last_end + min_gap:
+            st = round(last_end + min_gap, 3)
+            if ed <= st + 0.25:
+                ed = round(st + 0.35, 3)
 
-        # Natural reading duration: ~10-12 CPS + base buffer
-        natural_dur = max(1.2, min(5.8, (clean_len / 10.0) + 0.8))
-        raw_dur = max(0.4, raw_end - cur_start)
-        threshold = max(natural_dur * 1.3, min(3.5, natural_dur + 1.0))
+        # Natural reading duration check
+        clean_len = len(re.sub(r"\s+", "", txt))
+        min_reading_dur = max(0.8, min(5.0, (clean_len / 12.0) + 0.5))
+        if ed - st < min_reading_dur:
+            ed = round(st + min_reading_dur, 3)
 
-        if raw_dur > threshold:
-            target_dur = natural_dur
-        else:
-            target_dur = min(raw_dur, natural_dur + 0.5)
+        last_end = ed
+        final_start = round(st, 3)
+        final_end = round(ed, 3)
 
-        if i + 1 < num_segs:
-            next_start = float(valid_segments[i + 1].get("start", cur_start + 0.5))
-            # If next subtitle starts too early, push it forward to give current subtitle room
-            if next_start < cur_start + 0.35:
-                next_start = cur_start + 0.35
-                valid_segments[i + 1]["start"] = next_start
+        start_str = format_timestamp(final_start)
+        end_str = format_timestamp(final_end)
 
-            # Maintain strict 50ms transition gap before next subtitle begins
-            cur_end = min(cur_start + target_dur, next_start - 0.05)
-            cur_end = max(cur_start + 0.25, cur_end)
-
-            if cur_end >= next_start:
-                valid_segments[i + 1]["start"] = cur_end + 0.05
-        else:
-            cur_end = max(cur_start + 0.25, cur_start + target_dur)
-
-        final_start = round(cur_start, 3)
-        final_end = round(cur_end, 3)
-
-        seg["index"] = i + 1
-        seg["start"] = final_start
-        seg["end"] = final_end
-        formatted_start = format_timestamp(final_start)
-        formatted_end = format_timestamp(final_end)
-        seg["start_str"] = formatted_start
-        seg["end_str"] = formatted_end
-        seg["start_time_str"] = formatted_start
-        seg["end_time_str"] = formatted_end
-        optimized.append(seg)
+        optimized.append({
+            "index": len(optimized) + 1,
+            "start": final_start,
+            "end": final_end,
+            "start_str": start_str,
+            "end_str": end_str,
+            "start_time_str": start_str,
+            "end_time_str": end_str,
+            "text": txt,
+            "refined_text": txt,
+            "raw_text": txt
+        })
 
     return optimized
 

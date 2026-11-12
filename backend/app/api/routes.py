@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
-from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException, status, Request
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks, HTTPException, status, Request, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from starlette.concurrency import run_in_threadpool
 import aiofiles
@@ -30,7 +30,15 @@ from app.config import (
     get_whisper_config,
     get_media_scan_dirs
 )
-from app.models import TaskStatus, SubtitleSegment, UpdateSubtitlesRequest
+from app.models import (
+    TaskStatus,
+    SubtitleSegment,
+    UpdateSubtitlesRequest,
+    DictionaryEntryCreate,
+    DictionaryEntryUpdate,
+    DictionaryBatchDelete,
+    CloudLLMTestRequest,
+)
 from app.services.audio_extractor import extract_audio
 from app.services.whisper_stt import transcribe_audio
 from app.services.llm_refiner import refine_subtitles_with_llm
@@ -2111,6 +2119,13 @@ class SystemSettingsUpdateRequest(BaseModel):
     whisper_model_size: Optional[str] = None
     whisper_device: Optional[str] = None
     whisper_compute_type: Optional[str] = None
+    llm_provider: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_model: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
     requeue_completed: Optional[bool] = True
 
 
@@ -2216,7 +2231,7 @@ def _get_installed_ollama_models() -> List[Dict[str, Any]]:
 @router.get("/settings")
 async def get_system_settings_endpoint():
     """Returns current LLM & Whisper settings and available options for Admin UI select boxes."""
-    current = get_runtime_settings()
+    current = get_runtime_settings(mask_keys=True)
     installed_list = _get_installed_ollama_models()
     installed_names = {m["name"] for m in installed_list}
 
@@ -2245,12 +2260,19 @@ async def get_system_settings_endpoint():
             })
             seen_names.add(inst["name"])
 
+    cloud_models = {
+        "openai": ["gpt-4o", "gpt-4o-mini", "o3-mini", "gpt-4-turbo"],
+        "anthropic": ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"],
+        "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-pro", "gemini-1.5-flash"],
+    }
+
     return {
         "current": current,
         "db_type": "sqlite" if db.is_sqlite_db() else "postgres",
         "connected_db": db._connected_db_name or ("SQLite" if db.is_sqlite_db() else "PostgreSQL"),
         "ollama_models": merged_ollama_models,
         "installed_ollama_models": [m["name"] for m in installed_list],
+        "cloud_models": cloud_models,
         "whisper_models": WHISPER_MODEL_OPTIONS,
         "whisper_devices": WHISPER_DEVICE_OPTIONS,
         "whisper_compute_types": WHISPER_COMPUTE_OPTIONS,
@@ -2280,11 +2302,25 @@ async def update_system_settings_endpoint(
         except Exception as e:
             logger.warning(f"Failed to auto-requeue completed tasks on settings update: {e}")
 
+    # Return masked view of updated settings
+    masked_current = get_runtime_settings(mask_keys=True)
     return {
         "message": msg,
-        "current": updated,
+        "current": masked_current,
         "requeue": requeue_info
     }
+
+
+@router.post("/settings/test-cloud-llm")
+async def test_cloud_llm_endpoint(payload: CloudLLMTestRequest):
+    """Tests connectivity with designated provider (OpenAI, Anthropic, Gemini, Ollama)."""
+    from app.services.llm_provider import test_provider_connectivity
+    res = test_provider_connectivity(
+        provider=payload.provider,
+        api_key=payload.api_key,
+        model=payload.model
+    )
+    return res
 
 
 @router.post("/settings/pull-model")
@@ -2306,4 +2342,70 @@ async def pull_ollama_model_endpoint(payload: PullModelRequest):
     except Exception as e:
         logger.error(f"Failed to pull Ollama model '{model_name}': {e}")
         raise HTTPException(status_code=500, detail=f"모델 다운로드 실패: {str(e)}")
+
+
+# ==============================================================================
+# Proper Noun Dictionary Endpoints (고유명사 사전 API)
+# ==============================================================================
+
+@router.get("/dictionary")
+async def get_dictionary_endpoint(
+    page: int = Query(1, ge=1, description="페이지 번호 (기본 1)"),
+    size: int = Query(50, ge=1, le=200, description="페이지당 건수 (기본 50건)"),
+    query: Optional[str] = Query(None, description="원문 또는 번역어 검색어")
+):
+    """고유명사 사전 50건 단위 페이징 목록 조회"""
+    return db.get_dictionary_entries(page=page, size=size, query=query)
+
+
+@router.post("/dictionary")
+async def add_dictionary_entry_endpoint(payload: DictionaryEntryCreate):
+    """고유명사 사전 신규 단어 등록 (원문 중복 시 업데이트)"""
+    try:
+        entry = db.add_dictionary_entry(
+            source_word=payload.source_word,
+            target_word=payload.target_word,
+            notes=payload.notes
+        )
+        return {"message": "고유명사가 성공적으로 등록되었습니다.", "entry": entry}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error adding dictionary entry: {e}")
+        raise HTTPException(status_code=500, detail=f"고유명사 등록 오류: {str(e)}")
+
+
+@router.put("/dictionary/{entry_id}")
+async def update_dictionary_entry_endpoint(entry_id: int, payload: DictionaryEntryUpdate):
+    """고유명사 사전 단어 수정"""
+    try:
+        updated = db.update_dictionary_entry(
+            entry_id=entry_id,
+            source_word=payload.source_word,
+            target_word=payload.target_word,
+            notes=payload.notes
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="해당 고유명사 항목을 찾을 수 없습니다.")
+        return {"message": "고유명사가 수정되었습니다.", "entry": updated}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error updating dictionary entry: {e}")
+        raise HTTPException(status_code=500, detail=f"고유명사 수정 오류: {str(e)}")
+
+
+@router.delete("/dictionary/{entry_id}")
+async def delete_dictionary_entry_endpoint(entry_id: int):
+    """고유명사 항목 단건 삭제"""
+    deleted = db.delete_dictionary_entry(entry_id)
+    return {"message": "고유명사가 삭제되었습니다.", "success": deleted}
+
+
+@router.post("/dictionary/batch-delete")
+async def batch_delete_dictionary_endpoint(payload: DictionaryBatchDelete):
+    """고유명사 항목 일괄 다중 삭제"""
+    deleted_count = db.batch_delete_dictionary_entries(payload.ids)
+    return {"message": f"{deleted_count}건의 고유명사가 삭제되었습니다.", "deleted_count": deleted_count}
+
 

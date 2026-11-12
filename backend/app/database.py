@@ -157,6 +157,7 @@ def init_db():
 
     json_type = "TEXT" if is_sqlite else "JSONB"
     timestamp_type = "TIMESTAMP" if is_sqlite else "TIMESTAMP WITH TIME ZONE"
+    serial_pk = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "SERIAL PRIMARY KEY"
 
     create_table_sql = f"""
     CREATE TABLE IF NOT EXISTS transm_tasks (
@@ -206,6 +207,16 @@ def init_db():
         updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_studio_queue_order ON studio_queue_items (order_index, added_at);
+
+    CREATE TABLE IF NOT EXISTS proper_noun_dictionary (
+        id {serial_pk},
+        source_word VARCHAR(255) NOT NULL,
+        target_word VARCHAR(255) NOT NULL,
+        notes TEXT,
+        created_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP,
+        updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_dict_source ON proper_noun_dictionary (source_word);
     """
     with engine.begin() as conn:
         for stmt in create_table_sql.strip().split(";"):
@@ -945,3 +956,162 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
         "requeued_count": requeued_count,
         "purged_task_ids": list(purged_task_ids)
     }
+
+
+# ==============================================================================
+# Proper Noun Dictionary Database Operations (고유명사 사전)
+# ==============================================================================
+
+def get_dictionary_entries(
+    page: int = 1,
+    size: int = 50,
+    query: Optional[str] = None
+) -> Dict[str, Any]:
+    """Returns paginated proper noun dictionary entries (50 per page by default)."""
+    engine = get_engine()
+    page = max(1, int(page))
+    size = max(1, min(200, int(size)))
+    offset = (page - 1) * size
+
+    where_clause = ""
+    params: Dict[str, Any] = {"limit": size, "offset": offset}
+    if query and query.strip():
+        q = f"%{query.strip().lower()}%"
+        where_clause = "WHERE LOWER(source_word) LIKE :q OR LOWER(target_word) LIKE :q OR LOWER(COALESCE(notes, '')) LIKE :q"
+        params["q"] = q
+
+    count_sql = f"SELECT COUNT(*) FROM proper_noun_dictionary {where_clause};"
+    list_sql = f"""
+    SELECT id, source_word, target_word, notes, created_at, updated_at
+    FROM proper_noun_dictionary
+    {where_clause}
+    ORDER BY id DESC
+    LIMIT :limit OFFSET :offset;
+    """
+
+    with engine.connect() as conn:
+        total = conn.execute(text(count_sql), params).scalar() or 0
+        rows = conn.execute(text(list_sql), params).mappings().all()
+        items = []
+        for r in rows:
+            d = dict(r)
+            if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
+                d["created_at"] = d["created_at"].isoformat()
+            elif d.get("created_at"):
+                d["created_at"] = str(d["created_at"])
+            if d.get("updated_at") and hasattr(d["updated_at"], "isoformat"):
+                d["updated_at"] = d["updated_at"].isoformat()
+            elif d.get("updated_at"):
+                d["updated_at"] = str(d["updated_at"])
+            items.append(d)
+
+    total_pages = max(1, (total + size - 1) // size)
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "total_pages": total_pages
+    }
+
+
+def get_all_dictionary_map() -> Dict[str, str]:
+    """Returns entire dictionary as {source_word: target_word} mapping for fast translation lookup."""
+    engine = get_engine()
+    sql = "SELECT source_word, target_word FROM proper_noun_dictionary ORDER BY LENGTH(source_word) DESC;"
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+            return {str(r[0]): str(r[1]) for r in rows if r[0] and r[1]}
+    except Exception as e:
+        logger.warning(f"Error fetching all dictionary map: {e}")
+        return {}
+
+
+def add_dictionary_entry(source_word: str, target_word: str, notes: Optional[str] = None) -> Dict[str, Any]:
+    """Inserts a new dictionary entry or updates if source_word already exists."""
+    engine = get_engine()
+    s_word = source_word.strip()
+    t_word = target_word.strip()
+    if not s_word or not t_word:
+        raise ValueError("원문 단어와 번역 단어는 필수입니다.")
+
+    sql = """
+    INSERT INTO proper_noun_dictionary (source_word, target_word, notes, updated_at)
+    VALUES (:src, :tgt, :notes, CURRENT_TIMESTAMP)
+    ON CONFLICT (source_word) DO UPDATE SET
+        target_word = EXCLUDED.target_word,
+        notes = COALESCE(EXCLUDED.notes, proper_noun_dictionary.notes),
+        updated_at = CURRENT_TIMESTAMP;
+    """
+    with engine.begin() as conn:
+        conn.execute(text(sql), {"src": s_word, "tgt": t_word, "notes": notes or ""})
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, source_word, target_word, notes, created_at, updated_at FROM proper_noun_dictionary WHERE source_word = :src"),
+            {"src": s_word}
+        ).mappings().first()
+        res = dict(row)
+        if res.get("created_at") and hasattr(res["created_at"], "isoformat"):
+            res["created_at"] = res["created_at"].isoformat()
+        if res.get("updated_at") and hasattr(res["updated_at"], "isoformat"):
+            res["updated_at"] = res["updated_at"].isoformat()
+        return res
+
+
+def update_dictionary_entry(entry_id: int, source_word: str, target_word: str, notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Updates an existing dictionary entry by ID."""
+    engine = get_engine()
+    s_word = source_word.strip()
+    t_word = target_word.strip()
+    if not s_word or not t_word:
+        raise ValueError("원문 단어와 번역 단어는 필수입니다.")
+
+    sql = """
+    UPDATE proper_noun_dictionary
+    SET source_word = :src, target_word = :tgt, notes = :notes, updated_at = CURRENT_TIMESTAMP
+    WHERE id = :id;
+    """
+    with engine.begin() as conn:
+        conn.execute(text(sql), {"id": entry_id, "src": s_word, "tgt": t_word, "notes": notes or ""})
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, source_word, target_word, notes, created_at, updated_at FROM proper_noun_dictionary WHERE id = :id"),
+            {"id": entry_id}
+        ).mappings().first()
+        if not row:
+            return None
+        res = dict(row)
+        if res.get("created_at") and hasattr(res["created_at"], "isoformat"):
+            res["created_at"] = res["created_at"].isoformat()
+        if res.get("updated_at") and hasattr(res["updated_at"], "isoformat"):
+            res["updated_at"] = res["updated_at"].isoformat()
+        return res
+
+
+def delete_dictionary_entry(entry_id: int) -> bool:
+    """Deletes a dictionary entry by ID."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM proper_noun_dictionary WHERE id = :id;"), {"id": entry_id})
+    return True
+
+
+def batch_delete_dictionary_entries(ids: List[int]) -> int:
+    """Deletes multiple dictionary entries by IDs."""
+    if not ids:
+        return 0
+    clean_ids = [int(i) for i in ids if str(i).isdigit()]
+    if not clean_ids:
+        return 0
+    engine = get_engine()
+    placeholders = [f":id_{i}" for i in range(len(clean_ids))]
+    params = {f"id_{i}": cid for i, cid in enumerate(clean_ids)}
+    in_clause = ",".join(placeholders)
+    sql = f"DELETE FROM proper_noun_dictionary WHERE id IN ({in_clause});"
+    with engine.begin() as conn:
+        res = conn.execute(text(sql), params)
+        return res.rowcount
+

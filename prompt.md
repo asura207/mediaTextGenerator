@@ -276,6 +276,21 @@ MEDIA_SCAN_DIRS=
 | `sort_order` | `INTEGER` | 큐 순서 인덱스 |
 | `created_at` | `TIMESTAMP` | 등록 일시 |
 
+### 5.3 고유명사 사전 테이블 (`proper_noun_dictionary`)
+* **목적**: 인명, 캐릭터명, 지명, 작품 고유 명칭의 번역 일관성 강제 및 오역 방지
+* **DDL**:
+```sql
+CREATE TABLE IF NOT EXISTS proper_noun_dictionary (
+    id SERIAL PRIMARY KEY, -- SQLite의 경우 INTEGER PRIMARY KEY AUTOINCREMENT
+    source_word VARCHAR(255) NOT NULL,
+    target_word VARCHAR(255) NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dict_source ON proper_noun_dictionary (source_word);
+```
+
 ---
 
 ## 6. 주요 REST API 명세 요약
@@ -299,13 +314,54 @@ MEDIA_SCAN_DIRS=
 | `POST` | `/api/studio-queue/clear-completed`| 대기열 내 완료/오류 항목 정리 |
 | `POST` | `/api/translate/detect` | 자막 원문 언어 자동 감지 |
 | `POST` | `/api/translate/start` | 다국어 자막 번역 파이프라인 비동기 실행 |
-| `GET` | `/api/settings` | 현재 LLM 및 Whisper 런타임 설정 및 선택지 조회 |
-| `POST` | `/api/settings` | 관리자 엔진 설정 변경 (완료건 재추출 옵션 지원) |
+| `GET` | `/api/settings` | 현재 LLM 및 Whisper 런타임 설정 및 선택지 조회 (마스킹 키 및 클라우드 모델 목록) |
+| `POST` | `/api/settings` | 관리자 엔진 설정 변경 (멀티 클라우드 키/모델 및 완료건 재추출 제어) |
+| `POST` | `/api/settings/test-cloud-llm` | OpenAI, Claude, Gemini, Ollama 클라우드 API 연결 실시간 테스트 |
 | `POST` | `/api/settings/pull-model` | 로컬 Ollama 모델 다운로드/설치 |
+| `GET` | `/api/dictionary` | 고유명사 사전 50건 페이징 목록 조회 (`page`, `size=50`, `query`) |
+| `POST` | `/api/dictionary` | 고유명사 사전 신규 등록 (원문 중복 시 업데이트) |
+| `PUT` | `/api/dictionary/{entry_id}` | 고유명사 사전 항목 수정 |
+| `DELETE`| `/api/dictionary/{entry_id}` | 고유명사 사전 단건 삭제 |
+| `POST` | `/api/dictionary/batch-delete`| 고유명사 사전 항목 일괄 다중 삭제 |
 
 ---
 
-## 7. 로컬 실행 및 서비스 제어 가이드
+## 7. 핵심 파이프라인 아키텍처 특화 명세
+
+### 7.1 자막 노출 시간 연장 (+0.3s) 및 화자 발화 중첩(2줄 병합) 알고리즘 (`srt_generator.py`)
+1. **자막 종료 시점 +0.3초(300ms) 연장**:
+   - `ed = max(st + 0.35, raw_ed + 0.3)`
+   - 발화가 끝난 후 자막이 너무 급박하게 사라지지 않도록 시청자 가독 시간을 추가 확보.
+2. **화자 간 발화 중첩 구간 2줄 동시 노출**:
+   - 이전 세그먼트의 `end`가 다음 세그먼트의 `start`보다 늦은 겹침 감지 시:
+     - 겹치기 전 단독 발화 구간 슬라이싱
+     - 겹치는 동시 발화 구간은 `- 화자1 대사\n- 화자2 대사` 2줄 다이얼로그로 병합
+     - 겹친 후 잔여 발화 구간 분할
+3. **50ms Transition Gap & 역전 방어**:
+   - 모든 연속 자막 사이에 최소 50ms 안전 공백을 보장하여 시리즈온, 팟플레이어 등 플레이어에서 깜빡임 및 대사 씹힘 100% 방어.
+
+### 7.2 20년 차 시니어 영상 번역가 페르소나 및 고유명사 사전 연동 (`subtitle_translator.py`, `llm_refiner.py`)
+1. **페르소나 템플릿**:
+   - 20년 차 이상의 베테랑 외국어 전문 시니어 영상·애니메이션 번역가 지시어 반영.
+   - 원문 언어 `{0}`, 번역 대상 언어 `{1}` 동적 치환.
+2. **인명 번역 금지 & 고유명사 사전 최우선 적용**:
+   - 인명/캐릭터명은 임의 번역하지 않고 원문 발음 표기 유지.
+   - DB에 등록된 고유명사를 실시간 탐색하여 프롬프트에 `[고유명사 사전]`으로 주입.
+   - 번역 완료 후 사전 매핑 단어가 누락되지 않도록 후처리 치환 보장.
+3. **비명/신음/호흡 발화 100% 보존**:
+   - 감탄사, 비명, 신음, 숨소리(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...')를 절대 누락하지 않고 1:1로 온전히 번역에 반영.
+
+### 7.3 멀티 클라우드 LLM 통합 라우터 (`llm_provider.py`)
+* `httpx` 비동기/동기 HTTP 클라이언트를 활용하여 별도 SDK 의존성 충돌 없이 공식 엔드포인트 직호출:
+  * **OpenAI**: `https://api.openai.com/v1/chat/completions` (Bearer Auth)
+  * **Anthropic**: `https://api.anthropic.com/v1/messages` (x-api-key, system 필드 분리)
+  * **Google Gemini**: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
+  * **Ollama**: `http://localhost:11434` 로컬 네이티브 바인딩
+* `test_provider_connectivity()`를 통한 실시간 Ping 지연 시간 측정 및 오류 진단 지원.
+
+---
+
+## 8. 로컬 실행 및 서비스 제어 가이드
 
 1. **사전 준비**:
    * 로컬 PostgreSQL 서버 실행 및 데이터베이스 생성.
