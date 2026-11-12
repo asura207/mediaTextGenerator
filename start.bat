@@ -42,7 +42,11 @@ rem 2. 환경 설정 파일[.env] 확인
 if not exist "%~dp0.env" (
     echo [*] 환경설정 파일 [.env] 이 없습니다. 초기 간편 설정 마법사를 시작합니다...
     echo.
-    "%~dp0backend\venv\Scripts\python.exe" "%~dp0setup_wizard.py"
+    if exist "%~dp0install\setup_installer.py" (
+        "%~dp0backend\venv\Scripts\python.exe" "%~dp0install\setup_installer.py"
+    ) else (
+        "%~dp0backend\venv\Scripts\python.exe" "%~dp0setup_wizard.py"
+    )
     if not exist "%~dp0.env" (
         echo [ERROR] 설정이 완료되지 않았습니다.
         pause
