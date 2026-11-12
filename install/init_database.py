@@ -62,3 +62,4 @@ def run_init_database() -> bool:
 if __name__ == "__main__":
     success = run_init_database()
     sys.exit(0 if success else 1)
+

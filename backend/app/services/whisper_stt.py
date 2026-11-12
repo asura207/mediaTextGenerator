@@ -98,7 +98,7 @@ def transcribe_audio(
             speech_pad_ms=600            # Increased from 400ms -> 600ms: Protects initial gasps and trailing exhalations
         ),
         no_speech_threshold=0.65,         # Raised from 0.4 -> 0.65: Prevents Whisper from prematurely discarding emotional non-verbal vocalizations
-        logprob_threshold=-1.0,
+        log_prob_threshold=-1.0,          # faster-whisper keyword is log_prob_threshold (with underscore)
         compression_ratio_threshold=2.4,
         condition_on_previous_text=False, # Independent decoding avoids silence hallucination cascading
         initial_prompt="ああ、あっ、うっ、んっ、きゃあ、はぁ、いや、痛い、すごい、やめて、だめ… 아, 앗, 으윽, 꺄악, 하아, 싫어, 아파, 흑... Oh, Ah, Ugh, Wow"

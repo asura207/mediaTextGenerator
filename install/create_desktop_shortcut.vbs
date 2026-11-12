@@ -14,3 +14,4 @@ oLink.WindowStyle = 1
 oLink.Save
 
 WScript.Echo "[OK] 바탕화면에 'TransM - AI Subtitle Studio' 바로가기가 생성되었습니다."
+
