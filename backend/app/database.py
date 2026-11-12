@@ -947,15 +947,9 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
                 existing_fnames.add(fname)
                 next_order += 1
 
-        # 6. Delete old records from completed_tasks and transm_tasks to prevent stale completion state
-        conn.execute(text("DELETE FROM completed_tasks WHERE task_type = 'studio' OR task_type IS NULL;"))
-        if purged_task_ids:
-            purged_list = list(purged_task_ids)
-            placeholders = [f":id_{i}" for i in range(len(purged_list))]
-            params = {f"id_{i}": tid for i, tid in enumerate(purged_list)}
-            in_clause = ",".join(placeholders)
-            conn.execute(text(f"DELETE FROM transm_tasks WHERE task_id IN ({in_clause});"), params)
-        conn.execute(text("DELETE FROM transm_tasks WHERE LOWER(filename) NOT LIKE '%.srt';"))
+        # 6. Keep completed_tasks intact so users NEVER lose visibility or download access to previous results!
+        # Only remove failed/stale tasks from transm_tasks so fresh queue processing starts cleanly
+        conn.execute(text("DELETE FROM transm_tasks WHERE status = 'FAILED' AND LOWER(filename) NOT LIKE '%.srt';"))
 
         # 7. Reset ALL studio_queue_items back to WAITING
         conn.execute(text("""
@@ -971,10 +965,118 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
         total_waiting = conn.execute(text("SELECT count(*) FROM studio_queue_items WHERE status = 'WAITING';")).scalar()
         requeued_count = int(total_waiting or 0)
 
-    logger.info(f"Re-queued {requeued_count} studio tasks back to WAITING (purged {len(purged_task_ids)} old task records).")
+    logger.info(f"Re-queued {requeued_count} studio tasks back to WAITING (kept completed_tasks archive intact).")
     return {
         "requeued_count": requeued_count,
         "purged_task_ids": list(purged_task_ids)
+    }
+
+
+def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
+    """
+    Scans media search directories (MEDIA_SCAN_DIRS) and processed directory for existing .srt files,
+    and registers any missing ones into completed_tasks and transm_tasks with correct subtitle counts.
+    Ensures that previously completed subtitles are never lost and remain accessible in the Completed Tasks Archive.
+    """
+    import glob
+    import uuid
+    import re
+    from app.config import get_media_scan_dirs, PROCESSED_DIR
+
+    video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.ts', '.webm', '.m4v', '.mpg', '.mpeg', '.m2ts', '.mts'}
+    engine = get_engine()
+    dirs = get_media_scan_dirs()
+    dirs.append(PROCESSED_DIR)
+
+    discovered = []
+    for d in dirs:
+        if Path(d).exists():
+            try:
+                for s in glob.glob(os.path.join(str(d), '**/*.srt'), recursive=True):
+                    discovered.append(Path(s))
+            except Exception as e:
+                logger.warning(f"Error scanning {d} for .srt files: {e}")
+
+    synced_count = 0
+    with engine.begin() as conn:
+        existing_res = conn.execute(text("SELECT task_id, srt_path FROM completed_tasks")).fetchall()
+        existing_paths = {str(Path(r[1]).resolve()) for r in existing_res if r[1]}
+        existing_ids = {str(r[0]) for r in existing_res if r[0]}
+
+        for srt_p in discovered:
+            try:
+                resolved_str = str(srt_p.resolve())
+            except Exception:
+                resolved_str = str(srt_p)
+
+            if resolved_str in existing_paths:
+                continue
+
+            tid = str(uuid.uuid5(uuid.NAMESPACE_URL, resolved_str))
+            if tid in existing_ids:
+                continue
+
+            sub_count = 0
+            try:
+                with open(srt_p, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                sub_count = len(re.findall(r'^\d+\s*$', content, re.MULTILINE))
+            except Exception:
+                sub_count = 1
+
+            video_p = None
+            for vext in video_exts:
+                candidate = srt_p.with_suffix(vext)
+                if candidate.exists():
+                    video_p = str(candidate.resolve())
+                    break
+
+            filename = srt_p.with_suffix(Path(video_p).suffix).name if video_p else srt_p.name
+
+            conn.execute(text("""
+                INSERT INTO completed_tasks (
+                    task_id, filename, subtitle_count, srt_path, srt_download_url, task_type, completed_at
+                ) VALUES (
+                    :task_id, :filename, :subtitle_count, :srt_path, :srt_download_url, 'studio', CURRENT_TIMESTAMP
+                ) ON CONFLICT (task_id) DO UPDATE SET
+                    filename = EXCLUDED.filename,
+                    subtitle_count = EXCLUDED.subtitle_count,
+                    srt_path = EXCLUDED.srt_path,
+                    srt_download_url = EXCLUDED.srt_download_url;
+            """), {
+                "task_id": tid,
+                "filename": filename,
+                "subtitle_count": sub_count,
+                "srt_path": str(srt_p),
+                "srt_download_url": f"/api/download/{tid}"
+            })
+
+            conn.execute(text("""
+                INSERT INTO transm_tasks (
+                    task_id, filename, status, stage, progress, video_path, srt_path, srt_download_url, created_at, updated_at
+                ) VALUES (
+                    :task_id, :filename, 'COMPLETED', '작업 완료', 100, :video_path, :srt_path, :srt_download_url, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                ) ON CONFLICT (task_id) DO UPDATE SET
+                    status = 'COMPLETED',
+                    video_path = COALESCE(EXCLUDED.video_path, transm_tasks.video_path),
+                    srt_path = EXCLUDED.srt_path,
+                    updated_at = CURRENT_TIMESTAMP;
+            """), {
+                "task_id": tid,
+                "filename": filename,
+                "video_path": video_p,
+                "srt_path": str(srt_p),
+                "srt_download_url": f"/api/download/{tid}"
+            })
+
+            existing_paths.add(resolved_str)
+            existing_ids.add(tid)
+            synced_count += 1
+
+    logger.info(f"Synced {synced_count} existing SRT files from disk into completed_tasks.")
+    return {
+        "synced_count": synced_count,
+        "total_discovered": len(discovered)
     }
 
 

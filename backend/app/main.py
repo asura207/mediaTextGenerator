@@ -18,9 +18,19 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     try:
         init_db()
-        
-        # Auto-resume any interrupted PROCESSING tasks in background thread
+
         import threading
+        # Background sync of existing SRT files from media scan directories into completed_tasks
+        def _bg_sync_disk():
+            try:
+                from app.database import sync_disk_srt_to_completed_tasks
+                sync_disk_srt_to_completed_tasks()
+            except Exception as sync_err:
+                logging.warning(f"Background disk SRT sync failed: {sync_err}")
+
+        threading.Thread(target=_bg_sync_disk, daemon=True).start()
+
+        # Auto-resume any interrupted PROCESSING tasks in background thread
         from sqlalchemy import text
         from app.database import get_engine
         from app.api.routes import run_pipeline, tasks, TaskStatus

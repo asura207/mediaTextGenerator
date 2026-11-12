@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import {
   getCompletedTasks,
+  syncCompletedTasksFromDisk,
   downloadSrtFile,
   getTaskStatus,
   deleteTask,
@@ -52,6 +53,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isBatchDownloadingAll, setIsBatchDownloadingAll] = useState(false);
   const [isBatchDownloadingUndownloaded, setIsBatchDownloadingUndownloaded] = useState(false);
+  const [isSyncingDisk, setIsSyncingDisk] = useState(false);
   const playerRef = useRef(null);
 
   // Fetch completed tasks from PostgreSQL
@@ -428,6 +430,22 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
     }
   };
 
+  const handleSyncDisk = async () => {
+    try {
+      setIsSyncingDisk(true);
+      const res = await syncCompletedTasksFromDisk();
+      await refetch();
+      const count = res?.synced_count || 0;
+      const total = res?.total_discovered || 0;
+      alert(`디스크 자막 동기화 완료!\n총 ${total}개의 기존 .srt 파일 중 ${count}개의 자막이 보관함에 복구/동기화되었습니다.`);
+    } catch (err) {
+      console.error('Sync error:', err);
+      alert('디스크 자막 동기화 중 오류가 발생했습니다: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setIsSyncingDisk(false);
+    }
+  };
+
   const renderDeleteModal = () => {
     if (!deleteModalState.isOpen) return null;
     const { scope, task } = deleteModalState;
@@ -692,6 +710,16 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
               )}
             </button>
           )}
+
+          <button
+            onClick={handleSyncDisk}
+            disabled={isSyncingDisk || isFetching}
+            className="flex items-center space-x-1.5 px-3 py-2 text-xs font-medium text-emerald-300 hover:text-white bg-emerald-950/40 hover:bg-emerald-900/60 border border-emerald-700/50 rounded-xl transition-all shadow-sm disabled:opacity-50"
+            title="미디어 스캔 폴더(D:\원섭디스크 등)에 저장된 기존 .srt 자막 파일들을 검색하여 보관함에 복구 및 동기화합니다"
+          >
+            <FolderDown className={`w-3.5 h-3.5 ${isSyncingDisk ? 'animate-bounce text-emerald-400' : 'text-emerald-400'}`} />
+            <span>{isSyncingDisk ? '자막 동기화 중...' : '디스크 자막 동기화'}</span>
+          </button>
 
           <button
             onClick={() => refetch()}

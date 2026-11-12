@@ -48,6 +48,11 @@ export const getCompletedTasks = async (taskType = null) => {
   return response.data;
 };
 
+export const syncCompletedTasksFromDisk = async () => {
+  const response = await api.post('/completed-tasks/sync-disk');
+  return response.data;
+};
+
 export const updateSubtitles = async (taskId, subtitles) => {
   const response = await api.put(`/tasks/${taskId}/subtitles`, { subtitles });
   return response.data;

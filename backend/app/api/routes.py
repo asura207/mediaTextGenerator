@@ -591,6 +591,15 @@ async def list_completed_tasks(
         return []
 
 
+@router.post("/completed-tasks/sync-disk")
+async def sync_completed_tasks_from_disk_endpoint():
+    """
+    Scans media root directories and processed directory to discover existing .srt files,
+    and restores any unregistered completed tasks into completed_tasks and transm_tasks.
+    """
+    return await run_in_threadpool(db.sync_disk_srt_to_completed_tasks)
+
+
 @router.get("/tasks/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
     """Returns task execution progress, stage, and subtitle segments from memory, DB, or disk."""
@@ -606,6 +615,32 @@ async def get_task_status(task_id: str):
                         subs_raw = json.loads(subs_raw)
                     subs = [SubtitleSegment(**s) for s in subs_raw]
 
+                srt_file = None
+                if db_task.get("srt_path") and Path(db_task["srt_path"]).exists():
+                    srt_file = Path(db_task["srt_path"])
+                elif (PROCESSED_DIR / f"{task_id}.srt").exists():
+                    srt_file = PROCESSED_DIR / f"{task_id}.srt"
+
+                if srt_file:
+                    task_srt_paths[task_id] = srt_file
+                    if not subs:
+                        try:
+                            subs_pysrt = pysrt.open(str(srt_file), encoding="utf-8")
+                            for idx, sub in enumerate(subs_pysrt, start=1):
+                                start_s = sub.start.ordinal / 1000.0
+                                end_s = sub.end.ordinal / 1000.0
+                                subs.append(SubtitleSegment(
+                                    index=idx,
+                                    start=start_s,
+                                    end=end_s,
+                                    text=sub.text
+                                ))
+                        except Exception as parse_err:
+                            logger.warning(f"Could not parse srt file {srt_file} for task {task_id}: {parse_err}")
+
+                if db_task.get("video_path") and Path(db_task["video_path"]).exists():
+                    task_video_paths[task_id] = Path(db_task["video_path"])
+
                 task = TaskStatus(
                     task_id=db_task["task_id"],
                     filename=db_task["filename"],
@@ -613,15 +648,11 @@ async def get_task_status(task_id: str):
                     stage=db_task["stage"] or "",
                     progress=db_task["progress"],
                     video_url=f"/api/video/{task_id}",
-                    srt_download_url=db_task.get("srt_download_url"),
+                    srt_download_url=db_task.get("srt_download_url") or f"/api/download/{task_id}",
                     error=db_task.get("error"),
                     subtitles=subs
                 )
                 tasks[task_id] = task
-
-                srt_path = PROCESSED_DIR / f"{task_id}.srt"
-                if srt_path.exists():
-                    task_srt_paths[task_id] = srt_path
                 return task
         except Exception as e:
             logger.warning(f"Failed to restore task {task_id} from PostgreSQL: {e}")
@@ -724,12 +755,31 @@ async def download_srt(task_id: str):
     """Provides standard .srt file download matching original video filename."""
     srt_path = task_srt_paths.get(task_id)
     if not srt_path or not srt_path.exists():
-        fallback_srt = PROCESSED_DIR / f"{task_id}.srt"
-        if fallback_srt.exists():
-            srt_path = fallback_srt
+        # 1. Check DB (transm_tasks)
+        db_task = db.get_task(task_id)
+        if db_task and db_task.get("srt_path") and Path(db_task["srt_path"]).exists():
+            srt_path = Path(db_task["srt_path"])
             task_srt_paths[task_id] = srt_path
         else:
-            raise HTTPException(status_code=404, detail="Subtitles file not found or not ready")
+            # 2. Check completed_tasks table
+            try:
+                from sqlalchemy import text
+                with db.get_engine().connect() as conn:
+                    res = conn.execute(text("SELECT srt_path FROM completed_tasks WHERE task_id = :tid"), {"tid": task_id}).scalar()
+                    if res and Path(res).exists():
+                        srt_path = Path(res)
+                        task_srt_paths[task_id] = srt_path
+            except Exception:
+                pass
+
+        # 3. Fallback to PROCESSED_DIR
+        if not srt_path or not srt_path.exists():
+            fallback_srt = PROCESSED_DIR / f"{task_id}.srt"
+            if fallback_srt.exists():
+                srt_path = fallback_srt
+                task_srt_paths[task_id] = srt_path
+            else:
+                raise HTTPException(status_code=404, detail="Subtitles file not found or not ready")
 
     if srt_path.exists() and srt_path.stat().st_size == 0:
         raise HTTPException(status_code=400, detail="생성된 자막이 없어 다운로드할 수 없습니다. 상세 보기에서 자막을 추가해 주세요.")
