@@ -12,6 +12,7 @@ from app.config import (
     get_runtime_settings,
 )
 from app.database import get_all_dictionary_map
+from app.services.language_detector import LANG_NAMES, detect_subtitles_language
 from app.services.llm_provider import chat_completion
 from app.services.llm_refiner import (
     clean_json_response,
@@ -20,6 +21,7 @@ from app.services.llm_refiner import (
     fast_translate_short,
     sanitize_subtitle_text,
     is_valid_korean_result,
+    is_foreign_text as refiner_is_foreign_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,13 +30,7 @@ RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
 RE_JAPANESE = re.compile(r'[\u3040-\u30ff\uff65-\uff9f]')
 RE_KOREAN = re.compile(r'[\uac00-\ud7af\u3131-\u318e]')
 
-TARGET_LANG_NAMES = {
-    "ko": "한국어 (Korean)",
-    "en": "영어 (English)",
-    "ja": "일본어 (Japanese)",
-    "zh": "중국어 (Chinese)",
-    "es": "스페인어 (Spanish)",
-}
+TARGET_LANG_NAMES = {k: v for k, v in LANG_NAMES.items() if k != "unknown"}
 
 # 20년 차 시니어 번역가 페르소나 기본 템플릿 ({0}: 원본 언어, {1}: 대상 언어)
 SENIOR_TRANSLATOR_PROMPT_TEMPLATE = """당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 번역가입니다.
@@ -59,19 +55,15 @@ SENIOR_TRANSLATOR_PROMPT_TEMPLATE = """당신은 20년 차 이상의 경력을 �
 
 
 def detect_source_language_name(segments: List[Dict[str, Any]]) -> str:
-    """Infers source language from sample segment texts for dynamic prompt substitution."""
-    samples = []
-    for s in segments[:40]:
-        t = str(s.get("refined_text") or s.get("text") or s.get("raw_text") or "").strip()
-        if t:
-            samples.append(t)
-    joined = " ".join(samples)
-    if RE_JAPANESE.search(joined):
-        return "일본어"
-    elif RE_CHINESE.search(joined):
-        return "중국어"
-    elif re.search(r'[a-zA-Z]{5,}', joined):
-        return "영어"
+    """Detects source language across all world languages for dynamic prompt substitution."""
+    try:
+        info = detect_subtitles_language(segments)
+        code = info.get("code", "unknown")
+        name = info.get("name", "")
+        if code != "unknown" and name:
+            return name.split(" (")[0].strip() or code
+    except Exception:
+        pass
     return "원문 언어"
 
 
@@ -111,10 +103,8 @@ def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict
 
 
 def is_foreign_text(text: str) -> bool:
-    """Checks if text contains foreign characters (Chinese/Japanese)."""
-    if not text:
-        return False
-    return bool(RE_CHINESE.search(text) or RE_JAPANESE.search(text))
+    """Checks if text contains any non-Korean foreign script or untranslated Latin words."""
+    return refiner_is_foreign_text(text)
 
 
 def is_valid_translation_result(original: str, result: str, target_lang: str, dict_map: Optional[Dict[str, str]] = None) -> bool:

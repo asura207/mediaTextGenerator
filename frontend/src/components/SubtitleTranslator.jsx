@@ -37,6 +37,19 @@ const TARGET_LANGUAGES = [
   { code: 'es', name: '스페인어 (Spanish)', flag: '🇪🇸' },
   { code: 'fr', name: '프랑스어 (French)', flag: '🇫🇷' },
   { code: 'de', name: '독일어 (German)', flag: '🇩🇪' },
+  { code: 'it', name: '이탈리아어 (Italian)', flag: '🇮🇹' },
+  { code: 'pt', name: '포르투갈어 (Portuguese)', flag: '🇵🇹' },
+  { code: 'ru', name: '러시아어 (Russian)', flag: '🇷🇺' },
+  { code: 'vi', name: '베트남어 (Vietnamese)', flag: '🇻🇳' },
+  { code: 'th', name: '태국어 (Thai)', flag: '🇹🇭' },
+  { code: 'id', name: '인도네시아어 (Indonesian)', flag: '🇮🇩' },
+  { code: 'ar', name: '아랍어 (Arabic)', flag: '🇸🇦' },
+  { code: 'hi', name: '힌디어 (Hindi)', flag: '🇮🇳' },
+  { code: 'tr', name: '튀르키예어 (Turkish)', flag: '🇹🇷' },
+  { code: 'nl', name: '네덜란드어 (Dutch)', flag: '🇳🇱' },
+  { code: 'pl', name: '폴란드어 (Polish)', flag: '🇵🇱' },
+  { code: 'uk', name: '우크라이나어 (Ukrainian)', flag: '🇺🇦' },
+  { code: 'el', name: '그리스어 (Greek)', flag: '🇬🇷' },
 ];
 
 export default function SubtitleTranslator({ initialTaskId, onOpenInStudio, translatorQueue }) {

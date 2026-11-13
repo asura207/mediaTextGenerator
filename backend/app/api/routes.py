@@ -145,23 +145,24 @@ _SRT_FALLBACK_ENCODINGS = (
     "gb18030",
     "big5",
     "shift_jis",
+    "cp1251",
+    "cp1256",
+    "cp874",
+    "cp1254",
     "cp1252",
     "latin-1",
 )
 
 
-def parse_srt_segments_multi_encoding(srt_file: Any) -> List[Dict[str, Any]]:
+def parse_srt_bytes_multi_encoding(raw_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Parses an .srt file from disk supporting UTF-8, UTF-16, CP949/EUC-KR, GB18030, CP1252, etc.
-    Returns normalized subtitle segment dicts ready for SubtitleSegment / API serialization.
+    Decodes raw .srt bytes across UTF-8, UTF-16, and regional encodings worldwide,
+    returning normalized subtitle segment dicts.
     """
-    srt_file = Path(srt_file)
-    raw_bytes = srt_file.read_bytes()
     content_str: Optional[str] = None
     for enc in _SRT_FALLBACK_ENCODINGS:
         try:
             decoded = raw_bytes.decode(enc)
-            # Reject UTF-16 mis-decodes if no SRT arrow token is present
             if "-->" not in decoded:
                 continue
             content_str = decoded
@@ -192,6 +193,11 @@ def parse_srt_segments_multi_encoding(srt_file: Any) -> List[Dict[str, Any]]:
             "refined_text": sub.text,
         })
     return segments
+
+
+def parse_srt_segments_multi_encoding(srt_file: Any) -> List[Dict[str, Any]]:
+    """Parses an .srt file from disk supporting UTF-8, UTF-16, CJK, Cyrillic, Arabic, European encodings."""
+    return parse_srt_bytes_multi_encoding(Path(srt_file).read_bytes())
 
 
 def schedule_web_preview(task_id: str, video_path: Path, preview_path: Path) -> None:
@@ -2012,25 +2018,7 @@ async def detect_subtitles_endpoint(
         filename = file.filename
         content_bytes = await file.read()
         try:
-            content_str = content_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            content_str = content_bytes.decode('cp949', errors='ignore')
-
-        try:
-            subs = pysrt.from_string(content_str)
-            for sub in subs:
-                start_sec = sub.start.ordinal / 1000.0
-                end_sec = sub.end.ordinal / 1000.0
-                segments.append({
-                    "index": sub.index,
-                    "start": start_sec,
-                    "end": end_sec,
-                    "start_str": str(sub.start),
-                    "end_str": str(sub.end),
-                    "text": sub.text,
-                    "raw_text": sub.text,
-                    "refined_text": sub.text,
-                })
+            segments = parse_srt_bytes_multi_encoding(content_bytes)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"SRT 파일 구문 분석 실패: {e}")
 
@@ -2094,24 +2082,9 @@ async def start_translation_endpoint(
         base_filename = file.filename
         content_bytes = await file.read()
         try:
-            content_str = content_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            content_str = content_bytes.decode('cp949', errors='ignore')
-
-        subs = pysrt.from_string(content_str)
-        for sub in subs:
-            start_sec = sub.start.ordinal / 1000.0
-            end_sec = sub.end.ordinal / 1000.0
-            segments.append({
-                "index": sub.index,
-                "start": start_sec,
-                "end": end_sec,
-                "start_str": str(sub.start),
-                "end_str": str(sub.end),
-                "text": sub.text,
-                "raw_text": sub.text,
-                "refined_text": sub.text,
-            })
+            segments = parse_srt_bytes_multi_encoding(content_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"SRT 파일 구문 분석 실패: {e}")
     elif task_id:
         original_video_task_id = task_id
         base_filename, segments = load_segments_from_task(task_id)

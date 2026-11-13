@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 import ollama
@@ -14,6 +15,7 @@ from app.config import (
 )
 from app.database import get_all_dictionary_map
 from app.services.llm_provider import chat_completion
+from app.services.language_detector import detect_subtitles_language
 
 logger = logging.getLogger(__name__)
 
@@ -320,12 +322,47 @@ def is_ai_meta_response(raw_text: str, text: str) -> bool:
     return False
 
 
+def _is_hangul_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0xAC00 <= code <= 0xD7AF
+        or 0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+        or 0xA960 <= code <= 0xA97F
+        or 0xD7B0 <= code <= 0xD7FF
+    )
+
+
+def _has_any_unicode_letter(text: str) -> bool:
+    return any(unicodedata.category(ch).startswith("L") for ch in (text or ""))
+
+
+def _has_non_korean_unicode_script(text: str) -> bool:
+    """
+    Returns True if text contains ANY Unicode letter outside Hangul and ASCII Latin
+    (covers Japanese, Chinese, Cyrillic, Greek, Arabic, Hebrew, Thai, Devanagari,
+    Georgian, Armenian, Khmer, Myanmar, Ethiopic, accented Latin, etc.).
+    """
+    for ch in text or "":
+        if unicodedata.category(ch).startswith("L"):
+            if not _is_hangul_char(ch) and not (ch.isascii() and ch.isalpha()):
+                return True
+    return False
+
+
+def _strip_non_korean_unicode_letters(text: str) -> str:
+    return "".join(
+        ch for ch in (text or "")
+        if not (unicodedata.category(ch).startswith("L") and not _is_hangul_char(ch) and not (ch.isascii() and ch.isalpha()))
+    )
+
+
 def is_clean_korean_line(line: str, raw_text: str = "") -> bool:
     """Checks that a single candidate line is clean Korean without foreign scripts or AI meta-talk."""
     if not line or not line.strip():
         return False
     s = line.strip()
-    if RE_CHINESE.search(s) or RE_JAPANESE.search(s) or RE_OTHER_FOREIGN.search(s):
+    if _has_non_korean_unicode_script(s):
         return False
     if RE_CJK_PUNCT.search(s) or '""' in s or "''" in s or "\n" in s:
         return False
@@ -359,13 +396,13 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
         or "''" in s
         or "\n" in s
         or is_ai_meta_response(raw_s, s)
-        or RE_OTHER_FOREIGN.search(s)
+        or _has_non_korean_unicode_script(s)
         or RE_MIXED_GIBBERISH.search(s)
     )
     if not has_mess:
         return s
 
-    # 1. Check fast dictionary for known short CJK/Kana tokens
+    # 1. Check fast dictionary for known short CJK/Kana/EN tokens
     fast_hit = fast_translate_short(raw_s)
     if fast_hit:
         return fast_hit
@@ -373,8 +410,8 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
     # 2. Strip parenthetical AI notes & common prefixes ("번역 결과:")
     s_clean = re.sub(r'\((?:번역|요청|자연스럽|순수|구어체|결과|원문|의미)[^)]*\)', ' ', s)
     s_clean = re.sub(r'^(?:번역\s*결과|번역|교정\s*결과|수정\s*결과|결과)\s*[:：]\s*', '', s_clean.strip())
-    # Strip stray Cyrillic/Vietnamese characters if mixed with Korean
-    s_clean = RE_OTHER_FOREIGN.sub('', s_clean)
+    # Strip stray foreign script letters if mixed with Korean (keeping Hangul/ASCII/digits/punct)
+    s_clean = _strip_non_korean_unicode_letters(s_clean)
 
     # 3. Extract quoted Korean candidates (e.g. “혼자 하는 일도”)
     quoted_candidates = re.findall(r'[“"「『\']([^”"」』\'\n]{1,50})[”"」』\']', s_clean)
@@ -428,33 +465,17 @@ def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict
 
 
 def detect_batch_source_language(segments: List[Dict[str, Any]]) -> str:
-    """Detects the dominant language of STT segments so prompts explicitly require Korean translation."""
-    samples: List[str] = []
-    for s in segments[:60]:
-        t = str(s.get("raw_text") or s.get("text") or "").strip()
-        if t:
-            samples.append(t)
-    joined = " ".join(samples)
-    if not joined:
-        return "외국어"
-    ja_cnt = len(RE_JAPANESE.findall(joined))
-    zh_cnt = len(RE_CHINESE.findall(joined))
-    ko_cnt = len(RE_KOREAN.findall(joined))
-    latin_cnt = len(RE_LATIN_CHAR.findall(joined))
-    other_cnt = len(RE_OTHER_FOREIGN.findall(joined))
-
-    if ja_cnt >= 5 or (ja_cnt > 0 and ja_cnt >= latin_cnt):
-        return "일본어"
-    if zh_cnt >= 5 and zh_cnt > ko_cnt and zh_cnt > latin_cnt:
-        return "중국어"
-    if latin_cnt >= 8 and latin_cnt >= ko_cnt:
-        return "영어(또는 유럽어)"
-    if other_cnt >= 5 and other_cnt >= ko_cnt:
-        return "외국어"
-    if ko_cnt > 0 and (latin_cnt + ja_cnt + zh_cnt + other_cnt) < max(5, ko_cnt * 0.25):
-        return "한국어"
-    if latin_cnt > 0:
-        return "영어(또는 유럽어)"
+    """Detects dominant source language across all world languages via language_detector."""
+    try:
+        info = detect_subtitles_language(segments)
+        code = info.get("code", "unknown")
+        name = info.get("name", "")
+        if code == "ko":
+            return "한국어"
+        if code != "unknown" and name:
+            return name.split(" (")[0].strip() or code
+    except Exception:
+        pass
     return "외국어"
 
 
@@ -508,11 +529,11 @@ Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전�
 """
 
 def is_foreign_text(text: str) -> bool:
-    """Checks if text contains non-Korean foreign scripts (CJK/Kana/Cyrillic/Arabic/Latin words)."""
+    """Checks if text contains any non-Korean foreign script or untranslated Latin words."""
     if not text:
         return False
     s = str(text).strip()
-    if RE_CHINESE.search(s) or RE_JAPANESE.search(s) or RE_OTHER_FOREIGN.search(s) or RE_ACCENTED_LATIN.search(s):
+    if _has_non_korean_unicode_script(s):
         return True
     if not RE_URL.match(s) and RE_LATIN_WORD.search(s):
         return True
@@ -531,12 +552,12 @@ def _strip_allowed_dict_latin(text: str, dict_map: Optional[Dict[str, str]]) -> 
 def is_valid_korean_result(original: str, result: str, dict_map: Optional[Dict[str, str]] = None) -> bool:
     """
     Verifies that the result is translated into clean Korean Hangul regardless of STT source language
-    (English, Japanese, Chinese, European, Cyrillic, etc.), with zero CJK/meta-talk/untranslated lines.
+    across all world Unicode scripts, with zero untranslated foreign text or AI meta-talk.
     """
     if not result or not str(result).strip():
         return False
     res_str = str(result).strip()
-    if RE_CHINESE.search(res_str) or RE_JAPANESE.search(res_str) or RE_OTHER_FOREIGN.search(res_str) or RE_ACCENTED_LATIN.search(res_str):
+    if _has_non_korean_unicode_script(res_str):
         return False
     if RE_CJK_PUNCT.search(res_str) or '""' in res_str or "''" in res_str or "\n" in res_str:
         return False
@@ -551,14 +572,7 @@ def is_valid_korean_result(original: str, result: str, dict_map: Optional[Dict[s
     if dict_map and orig_str in dict_map and res_str == dict_map[orig_str]:
         return True
 
-    orig_has_letters = bool(
-        RE_CHINESE.search(orig_str)
-        or RE_JAPANESE.search(orig_str)
-        or RE_OTHER_FOREIGN.search(orig_str)
-        or RE_KOREAN.search(orig_str)
-        or RE_LATIN_CHAR.search(orig_str)
-    )
-    if not orig_has_letters:
+    if not _has_any_unicode_letter(orig_str):
         return True
 
     res_check = _strip_allowed_dict_latin(res_str, dict_map)
@@ -570,11 +584,11 @@ def is_valid_korean_result(original: str, result: str, dict_map: Optional[Dict[s
     if dict_map and res_check != res_str and latin_chars == 0 and ko_chars == 0 and not RE_ACCENTED_LATIN.search(res_check):
         return True
 
-    # Must contain Korean Hangul when the original contained speech/letters
+    # Must contain Korean Hangul when the original contained any linguistic letters
     if ko_chars == 0:
         return False
 
-    # Reject untranslated or half-translated English/Latin clauses mixed into output
+    # Reject untranslated or half-translated Latin/European clauses mixed into output
     if latin_words:
         # Allow a single short uppercase acronym (e.g., "TV", "OK", "AI", "PC") inside Korean text
         if len(latin_words) == 1 and re.fullmatch(r'[A-Z]{2,3}', latin_words[0]):
