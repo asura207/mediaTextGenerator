@@ -50,9 +50,54 @@ def resolve_active_ollama_model(client: Optional[ollama.Client] = None) -> str:
 RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
 RE_JAPANESE = re.compile(r'[\u3040-\u30ff\uff65-\uff9f]')
 RE_KOREAN = re.compile(r'[\uac00-\ud7af\u3131-\u318e]')
-RE_OTHER_FOREIGN = re.compile(r'[\u0400-\u04ff\u0600-\u06ff\u0e00-\u0e7f\u1ea0-\u1ef9]')
+RE_OTHER_FOREIGN = re.compile(r'[\u0400-\u04ff\u0590-\u05ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f\u1ea0-\u1ef9]')
+RE_ACCENTED_LATIN = re.compile(r'[\u00c0-\u024f]')
+RE_LATIN_CHAR = re.compile(r'[a-zA-Z\u00c0-\u024f]')
+RE_LATIN_WORD = re.compile(r'[a-zA-Z\u00c0-\u024f]{2,}')
+RE_URL = re.compile(r'^(?:https?://\S+|www\.\S+|[\w\-\.]+\.(?:com|net|org|cc|tv|me|xyz|cn|jp|kr|io|co)\S*)$', re.I)
 RE_CJK_PUNCT = re.compile(r'[。，：；“”‘’「」『』【】《》〈〉（）？！]')
 RE_MIXED_GIBBERISH = re.compile(r'[\uac00-\ud7af][a-zA-Z]{2,}|[a-zA-Z]{2,}[\uac00-\ud7af]')
+
+SHORT_EN_DICT = {
+    "oh": "오",
+    "ah": "아",
+    "uh": "어...",
+    "um": "음...",
+    "hmm": "음...",
+    "hey": "저기",
+    "hi": "안녕",
+    "hello": "안녕하세요",
+    "yeah": "응",
+    "yep": "응",
+    "yes": "네",
+    "no": "아니",
+    "nope": "아니",
+    "ok": "알겠어",
+    "okay": "알겠어",
+    "what": "뭐?",
+    "huh": "어?",
+    "wait": "잠깐",
+    "stop": "멈춰",
+    "sorry": "미안해",
+    "thanks": "고마워",
+    "thank you": "고마워",
+    "please": "제발",
+    "wow": "와",
+    "ooh": "우와",
+    "ugh": "으윽",
+    "ow": "아얏",
+    "bye": "잘 가",
+    "goodbye": "안녕히 가세요",
+    "come on": "어서",
+    "right": "맞아",
+    "well": "글쎄",
+    "sure": "물론이지",
+    "really": "정말?",
+    "great": "좋아",
+    "good": "좋아",
+    "fine": "괜찮아",
+    "help": "도와줘",
+}
 
 SHORT_CJK_DICT = {
     "好": "좋아",
@@ -234,7 +279,7 @@ AI_META_PATTERNS = re.compile(
 
 
 def fast_translate_short(raw_text: str) -> str:
-    """Directly converts common 1-3 char CJK tokens, Kana stutters, or URLs without LLM hallucination."""
+    """Directly converts common 1-3 char CJK/English tokens, Kana stutters, or URLs without LLM hallucination."""
     raw_s = (raw_text or "").strip()
     if not raw_s:
         return ""
@@ -246,6 +291,11 @@ def fast_translate_short(raw_text: str) -> str:
     if raw_no_punct in SHORT_CJK_DICT:
         suffix = "?" if ("?" in raw_s or "？" in raw_s) else ("!" if ("!" in raw_s or "！" in raw_s) else "")
         base = SHORT_CJK_DICT[raw_no_punct].rstrip(".?!")
+        return (base + suffix) if base else "..."
+    en_key = raw_no_punct.lower()
+    if en_key in SHORT_EN_DICT:
+        suffix = "?" if "?" in raw_s else ("!" if "!" in raw_s else ("..." if raw_s.endswith("...") else ""))
+        base = SHORT_EN_DICT[en_key].rstrip(".?!")
         return (base + suffix) if base else "..."
     if re.match(r'^[\w\-\.]+\.(?:com|net|org|cc|tv|me|xyz|cn|jp|kr)\b', raw_s, re.I):
         return raw_s
@@ -299,7 +349,7 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
     """
     raw_s = str(raw_text or "").strip()
     if not text or not str(text).strip():
-        return fast_translate_short(raw_s) or raw_s
+        return fast_translate_short(raw_s)
 
     s = str(text).strip()
 
@@ -368,10 +418,44 @@ def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict
     if not orig_text or not trans_text or not dict_map:
         return trans_text
     res = trans_text
+    orig_lower = orig_text.lower()
     for src, tgt in dict_map.items():
         if src in orig_text and src in res:
             res = res.replace(src, tgt)
+        elif src.isascii() and src.lower() in orig_lower and src.lower() in res.lower():
+            res = re.sub(re.escape(src), tgt, res, flags=re.IGNORECASE)
     return res
+
+
+def detect_batch_source_language(segments: List[Dict[str, Any]]) -> str:
+    """Detects the dominant language of STT segments so prompts explicitly require Korean translation."""
+    samples: List[str] = []
+    for s in segments[:60]:
+        t = str(s.get("raw_text") or s.get("text") or "").strip()
+        if t:
+            samples.append(t)
+    joined = " ".join(samples)
+    if not joined:
+        return "외국어"
+    ja_cnt = len(RE_JAPANESE.findall(joined))
+    zh_cnt = len(RE_CHINESE.findall(joined))
+    ko_cnt = len(RE_KOREAN.findall(joined))
+    latin_cnt = len(RE_LATIN_CHAR.findall(joined))
+    other_cnt = len(RE_OTHER_FOREIGN.findall(joined))
+
+    if ja_cnt >= 5 or (ja_cnt > 0 and ja_cnt >= latin_cnt):
+        return "일본어"
+    if zh_cnt >= 5 and zh_cnt > ko_cnt and zh_cnt > latin_cnt:
+        return "중국어"
+    if latin_cnt >= 8 and latin_cnt >= ko_cnt:
+        return "영어(또는 유럽어)"
+    if other_cnt >= 5 and other_cnt >= ko_cnt:
+        return "외국어"
+    if ko_cnt > 0 and (latin_cnt + ja_cnt + zh_cnt + other_cnt) < max(5, ko_cnt * 0.25):
+        return "한국어"
+    if latin_cnt > 0:
+        return "영어(또는 유럽어)"
+    return "외국어"
 
 
 def build_refiner_dict_section(batch_segments: List[Dict[str, Any]], dict_map: Dict[str, str]) -> str:
@@ -381,8 +465,9 @@ def build_refiner_dict_section(batch_segments: List[Dict[str, Any]], dict_map: D
     matched: Dict[str, str] = {}
     for s in batch_segments:
         txt = str(s.get("raw_text") or s.get("text") or "")
+        txt_lower = txt.lower()
         for src, tgt in dict_map.items():
-            if src in txt:
+            if src in txt or (src.isascii() and src.lower() in txt_lower):
                 matched[src] = tgt
     if not matched:
         return ""
@@ -393,20 +478,21 @@ def build_refiner_dict_section(batch_segments: List[Dict[str, Any]], dict_map: D
 
 
 SYSTEM_PROMPT = """당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 영상 번역가이자 한국어 자막 교정 전문가입니다.
-Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전달받게 됩니다.
-원래의 의미, 감정선, 캐릭터의 성격, 그리고 말투를 그대로 살려 실제 방송/영화/애니메이션처럼 자연스럽고 유창한 한국어 구어체로 교정 및 번역해 주세요.
+Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전달받게 됩니다. STT 원문이 영어, 일본어, 중국어, 유럽어 등 어떤 언어이든 상관없이 최종 출력은 반드시 100% 한국어(한글) 자막이어야 합니다.
+원래의 의미, 감정선, 캐릭터의 성격, 그리고 말투를 그대로 살려 실제 방송/영화/애니메이션처럼 자연스럽고 유창한 한국어 구어체로 번역 및 교정해 주세요.
 
 [핵심 번역 및 교정 지침]
-1. **인명 번역 금지 및 고유명사 일관성**:
-   - 캐릭터 이름이나 인명은 번역하거나 다른 단어로 의역하지 말고 원문 의미/발음 표기를 그대로 유지하세요(단, 고유명사 사전에 등록된 경우는 사전 표기를 따름).
+1. **인명 번역 금지(의미 의역 금지) 및 음차/사전 표기**:
+   - 캐릭터 이름이나 인명은 뜻을 임의로 번역하지 말고 한국어 발음(음차) 표기로 자연스럽게 옮기세요(단, 고유명사 사전에 등록된 경우는 반드시 사전 표기를 따름). 예: Harry -> 해리.
 2. **고유명사 사전 최우선 적용**:
    - 함께 제공되는 [고유명사 사전]에 등록된 원문 단어가 대사에 등장할 경우, 반드시 사전에 지정된 '번역 단어'를 최우선으로 사용해 주세요.
 3. **자연스러운 일상 구어체(대화체) 원칙**:
    - 사전이나 책을 읽는 듯한 딱딱하고 어색한 문어체(~하는 것이다, ~에 있어서 등)는 절대 사용하지 마세요.
    - 실제 사람이 일상에서 자연스럽게 대화하듯 유려하고 생생한 구어체(대화체)로 번역 및 의역하세요.
    - 번역투 3인칭 대명사('그는', '그녀는', '그것은' 등)는 생략하거나 자연스러운 대화체로 바꾸세요.
-4. **외국어(일본어 가나/한자, 중국어 한자 등) 100% 순수 한글 번역 필수**:
-   - 원문에 남아있는 일본어 히라가나/가타카나, 한자, 중국어를 단 한 글자도 남기지 말고 100% 순수 한국어(한글)로 번역하세요.
+4. **모든 외국어(영어, 일본어, 중국어 등 언어 불문) 100% 순수 한글 번역 필수**:
+   - 원문이 영어, 일본어, 중국어, 프랑스어, 스페인어 등 어떤 언어로 추출되었든 외국어 문장이나 단어를 원문 그대로 남기지 말고 예외 없이 100% 자연스러운 한국어(한글)로 번역하세요.
+   - 영어 알파벳 문장을 그대로 복사하거나 일본어/한자를 남기면 절대 안 됩니다.
 5. **감탄사, 비명, 신음, 숨소리 100% 보존 원칙 (절대 누락/삭제 금지)**:
    - 등장인물의 감탄사, 비명, 신음, 헐떡임, 놀람, 당황, 흐느낌 등 비언어적/정서적 발화(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...' 등)는 절대 생략하거나 삭제하지 말고 1:1로 온전히 살려두세요.
 6. **세그먼트 1:1 유지**:
@@ -422,21 +508,35 @@ Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전�
 """
 
 def is_foreign_text(text: str) -> bool:
-    """Checks if text contains foreign characters (Chinese/Japanese Kana or Kanji)."""
+    """Checks if text contains non-Korean foreign scripts (CJK/Kana/Cyrillic/Arabic/Latin words)."""
     if not text:
         return False
-    return bool(RE_CHINESE.search(text) or RE_JAPANESE.search(text))
+    s = str(text).strip()
+    if RE_CHINESE.search(s) or RE_JAPANESE.search(s) or RE_OTHER_FOREIGN.search(s) or RE_ACCENTED_LATIN.search(s):
+        return True
+    if not RE_URL.match(s) and RE_LATIN_WORD.search(s):
+        return True
+    return False
 
-def is_valid_korean_result(original: str, result: str) -> bool:
+def _strip_allowed_dict_latin(text: str, dict_map: Optional[Dict[str, str]]) -> str:
+    """Removes dictionary-registered Latin targets before checking for leftover untranslated English."""
+    if not dict_map:
+        return text
+    cleaned = text
+    for tgt in dict_map.values():
+        if tgt and any(ch.isascii() and ch.isalpha() for ch in tgt):
+            cleaned = re.sub(re.escape(tgt), " ", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+def is_valid_korean_result(original: str, result: str, dict_map: Optional[Dict[str, str]] = None) -> bool:
     """
-    Verifies that the result contains zero Japanese Kana or CJK Ideographs (Kanji/Hanzi),
-    zero CJK explanation punctuation (。，：“”「」), zero AI meta-talk,
-    and contains valid Korean Hangul when the original had text.
+    Verifies that the result is translated into clean Korean Hangul regardless of STT source language
+    (English, Japanese, Chinese, European, Cyrillic, etc.), with zero CJK/meta-talk/untranslated lines.
     """
     if not result or not str(result).strip():
         return False
     res_str = str(result).strip()
-    if is_foreign_text(res_str) or RE_OTHER_FOREIGN.search(res_str):
+    if RE_CHINESE.search(res_str) or RE_JAPANESE.search(res_str) or RE_OTHER_FOREIGN.search(res_str) or RE_ACCENTED_LATIN.search(res_str):
         return False
     if RE_CJK_PUNCT.search(res_str) or '""' in res_str or "''" in res_str or "\n" in res_str:
         return False
@@ -444,10 +544,46 @@ def is_valid_korean_result(original: str, result: str) -> bool:
         return False
     if is_ai_meta_response(original, res_str):
         return False
-    orig_clean = re.sub(r'[ー~〜\-\s\.\,\!\?…]+', '', str(original or ''))
-    if orig_clean and is_foreign_text(orig_clean):
-        if not RE_KOREAN.search(res_str):
+
+    orig_str = str(original or "").strip()
+    if RE_URL.match(orig_str):
+        return True
+    if dict_map and orig_str in dict_map and res_str == dict_map[orig_str]:
+        return True
+
+    orig_has_letters = bool(
+        RE_CHINESE.search(orig_str)
+        or RE_JAPANESE.search(orig_str)
+        or RE_OTHER_FOREIGN.search(orig_str)
+        or RE_KOREAN.search(orig_str)
+        or RE_LATIN_CHAR.search(orig_str)
+    )
+    if not orig_has_letters:
+        return True
+
+    res_check = _strip_allowed_dict_latin(res_str, dict_map)
+    ko_chars = len(RE_KOREAN.findall(res_str))
+    latin_chars = len(RE_LATIN_CHAR.findall(res_check))
+    latin_words = RE_LATIN_WORD.findall(res_check)
+
+    # If the entire line consists of dictionary-approved proper nouns + punctuation, accept it
+    if dict_map and res_check != res_str and latin_chars == 0 and ko_chars == 0 and not RE_ACCENTED_LATIN.search(res_check):
+        return True
+
+    # Must contain Korean Hangul when the original contained speech/letters
+    if ko_chars == 0:
+        return False
+
+    # Reject untranslated or half-translated English/Latin clauses mixed into output
+    if latin_words:
+        # Allow a single short uppercase acronym (e.g., "TV", "OK", "AI", "PC") inside Korean text
+        if len(latin_words) == 1 and re.fullmatch(r'[A-Z]{2,3}', latin_words[0]):
+            return True
+        if len(latin_words) >= 2 and latin_chars >= ko_chars:
             return False
+        if latin_chars > max(3, int(ko_chars * 1.2)):
+            return False
+
     return True
 
 def clean_json_response(content: str) -> str:
@@ -548,7 +684,8 @@ def refine_single_segment_fallback(
     client: Optional[ollama.Client],
     seg_id: int,
     raw_text: str,
-    dict_map: Optional[Dict[str, str]] = None
+    dict_map: Optional[Dict[str, str]] = None,
+    source_lang_hint: str = "외국어"
 ) -> str:
     """Ultra-reliable single-line translation/refinement fallback with Senior persona and dictionary lookup."""
     if not raw_text or not str(raw_text).strip():
@@ -564,10 +701,10 @@ def refine_single_segment_fallback(
     dict_section = build_refiner_dict_section([{"text": raw_clean}], dict_map)
     system_prompt = (
         "당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 번역가입니다. "
-        "입력된 자막을 자연스러운 한국어 구어체 한 문장으로 번역 및 교정하여 "
+        f"원문 언어({source_lang_hint})로 된 입력 자막을 원문 그대로 남기지 말고 반드시 자연스러운 한국어(한글) 구어체 한 문장으로 번역 및 교정하여 "
         '반드시 {"text": "번역된 한국어 자막"} 형식의 JSON으로만 응답하세요. '
-        "인명은 원문 발음대로 보존하고 고유명사 사전을 최우선 적용하세요. "
-        f"{dict_section}\n부연 설명이나 전각 기호를 절대 포함하지 마세요."
+        "인명은 원문 발음대로 한글 음차 표기하고 고유명사 사전을 최우선 적용하세요. "
+        f"{dict_section}\n부연 설명, 원문 외국어(영어/일본어/중국어 등) 복사, 전각 기호를 절대 포함하지 마세요."
     )
     user_prompt = json.dumps({"id": seg_id, "text": raw_clean}, ensure_ascii=False)
 
@@ -594,7 +731,7 @@ def refine_single_segment_fallback(
             sanitized = sanitize_subtitle_text(raw_clean, candidate)
             if dict_map:
                 sanitized = apply_dictionary_postprocess(raw_clean, sanitized, dict_map)
-            if sanitized and is_valid_korean_result(raw_clean, sanitized):
+            if sanitized and is_valid_korean_result(raw_clean, sanitized, dict_map):
                 return sanitized
         except Exception as e:
             logger.warning(f"Single segment refinement failed for #{seg_id} (attempt {attempt + 1}): {e}")
@@ -607,7 +744,8 @@ def refine_single_segment_fallback(
 def refine_subtitles_batch(
     client: Optional[ollama.Client],
     batch_segments: List[Dict[str, Any]],
-    dict_map: Optional[Dict[str, str]] = None
+    dict_map: Optional[Dict[str, str]] = None,
+    source_lang_hint: str = "외국어"
 ) -> Dict[int, str]:
     """Refines a single batch of segments via unified LLM router with Senior persona and dictionary injection."""
     input_payload = [{"id": s["index"], "text": s["raw_text"]} for s in batch_segments]
@@ -615,7 +753,18 @@ def refine_subtitles_batch(
     dict_section = build_refiner_dict_section(batch_segments, dict_map)
 
     full_system = SYSTEM_PROMPT + (dict_section if dict_section else "")
-    user_prompt = f"다음 자막 세그먼트들을 자연스럽고 유창한 한국어 구어체로 교정 및 번역해 주세요:\n{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
+    if source_lang_hint == "한국어":
+        user_prompt = (
+            "다음 자막 세그먼트들을 자연스럽고 유창한 한국어 구어체로 교정하고, "
+            f"외국어(영어/일본어/중국어 등)가 포함된 경우 예외 없이 한국어로 번역해 주세요:\n"
+            f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
+        )
+    else:
+        user_prompt = (
+            f"원문 감지 언어: [{source_lang_hint}]\n"
+            "아래 자막 세그먼트들을 원문 그대로 남기지 말고, 예외 없이 100% 자연스럽고 유창한 한국어(한글) 구어체 자막으로 번역해 주세요:\n"
+            f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
+        )
 
     try:
         response_text = chat_completion(
@@ -645,7 +794,7 @@ def refine_subtitles_batch(
                 logger.warning(f"Could not parse LLM JSON batch: {e}. Attempting regex fallback.")
                 result_map = extract_subtitles_via_regex(response_text)
 
-    # Validate & sanitize results: if invalid or meta-response, retry individually
+    # Validate & sanitize results: if invalid or untranslated/meta-response, retry individually
     for seg in batch_segments:
         sid = seg["index"]
         raw = seg.get("raw_text", "")
@@ -653,24 +802,30 @@ def refine_subtitles_batch(
             trans = sanitize_subtitle_text(raw, result_map[sid])
             if dict_map:
                 trans = apply_dictionary_postprocess(raw, trans, dict_map)
-            if is_valid_korean_result(raw, trans):
+            if is_valid_korean_result(raw, trans, dict_map):
                 result_map[sid] = trans
             else:
                 logger.info(f"Segment #{sid} returned invalid/untranslated text '{result_map[sid]}'. Retrying individually.")
-                result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map)
+                result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map, source_lang_hint)
         else:
-            result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map)
+            result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map, source_lang_hint)
 
     return result_map
 
-def filter_clean_checkpoint(checkpoint: Dict[int, str], segments_by_id: Dict[int, Dict[str, Any]]) -> Dict[int, str]:
+def filter_clean_checkpoint(
+    checkpoint: Dict[int, str],
+    segments_by_id: Dict[int, Dict[str, Any]],
+    dict_map: Optional[Dict[str, str]] = None
+) -> Dict[int, str]:
     """Sanitizes and removes any cached items that are untranslated foreign text or AI meta-responses."""
     clean: Dict[int, str] = {}
     for sid, val in checkpoint.items():
         orig_seg = segments_by_id.get(sid)
         orig_raw = orig_seg.get("raw_text", "") if orig_seg else ""
         sanitized = sanitize_subtitle_text(orig_raw, val)
-        if is_valid_korean_result(orig_raw, sanitized):
+        if dict_map and sanitized:
+            sanitized = apply_dictionary_postprocess(orig_raw, sanitized, dict_map)
+        if is_valid_korean_result(orig_raw, sanitized, dict_map):
             clean[sid] = sanitized
         else:
             logger.info(f"Purging invalid/untranslated cached item #{sid}: '{val}'")
@@ -695,6 +850,9 @@ def refine_subtitles_with_llm(
     if not batch_size:
         batch_size = get_llm_batch_size()
 
+    source_lang_hint = detect_batch_source_language(segments)
+    logger.info(f"Detected dominant STT source language for Korean translation/refinement: {source_lang_hint}")
+
     provider = get_active_llm_provider()
     client = None
     if provider == "ollama":
@@ -704,7 +862,12 @@ def refine_subtitles_with_llm(
             active_model = resolve_active_ollama_model(client)
             logger.info(f"Connected to Ollama host: {OLLAMA_HOST}, active model: {active_model}")
         except Exception as e:
-            logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement and keeping raw STT text.")
+            if source_lang_hint != "한국어":
+                raise RuntimeError(
+                    f"Ollama 서비스({OLLAMA_HOST})에 연결할 수 없어 '{source_lang_hint}' STT 자막을 한국어로 번역할 수 없습니다. "
+                    f"Ollama 실행 상태를 확인하거나 관리자 설정에서 클라우드 LLM을 선택해 주세요. ({e})"
+                )
+            logger.warning(f"Could not connect to Ollama service at {OLLAMA_HOST} ({e}). Skipping LLM refinement for Korean STT.")
             return segments
     else:
         settings = get_runtime_settings()
@@ -723,14 +886,14 @@ def refine_subtitles_with_llm(
     # Load initial checkpoint from parameter or disk fallback
     checkpoint_map: Dict[int, str] = {}
     if initial_checkpoint:
-        checkpoint_map = filter_clean_checkpoint(dict(initial_checkpoint), segments_by_id)
+        checkpoint_map = filter_clean_checkpoint(dict(initial_checkpoint), segments_by_id, dict_map)
         logger.info(f"Loaded {len(checkpoint_map)} clean refined segments from database checkpoint.")
     elif checkpoint_path and checkpoint_path.exists():
         try:
             with open(checkpoint_path, "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
                 loaded = {int(k): v for k, v in raw_data.items()}
-                checkpoint_map = filter_clean_checkpoint(loaded, segments_by_id)
+                checkpoint_map = filter_clean_checkpoint(loaded, segments_by_id, dict_map)
             logger.info(f"Loaded {len(checkpoint_map)} clean refined segments from checkpoint file {checkpoint_path}")
         except Exception as e:
             logger.warning(f"Failed to load checkpoint file: {e}")
@@ -754,7 +917,7 @@ def refine_subtitles_with_llm(
             continue
 
         try:
-            refined_map = refine_subtitles_batch(client, batch, dict_map)
+            refined_map = refine_subtitles_batch(client, batch, dict_map, source_lang_hint)
             for seg in batch:
                 seg_id = seg["index"]
                 if seg_id in refined_map and refined_map[seg_id]:
@@ -765,9 +928,9 @@ def refine_subtitles_with_llm(
                     seg["refined_text"] = checkpoint_map[seg_id]
                 else:
                     # Single line fallback
-                    fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map)
+                    fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map, source_lang_hint)
                     seg["refined_text"] = fb
-                    if is_valid_korean_result(seg["raw_text"], fb):
+                    if is_valid_korean_result(seg["raw_text"], fb, dict_map):
                         checkpoint_map[seg_id] = fb
 
             logger.info(f"Refined batch {current_batch_num}/{total_batches}")
@@ -796,9 +959,9 @@ def refine_subtitles_with_llm(
             logger.error(f"Error refining batch {current_batch_num}/{total_batches}: {e}. Retrying segments individually...")
             for seg in batch:
                 seg_id = seg["index"]
-                fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map)
+                fb = refine_single_segment_fallback(client, seg_id, seg["raw_text"], dict_map, source_lang_hint)
                 seg["refined_text"] = fb
-                if is_valid_korean_result(seg["raw_text"], fb):
+                if is_valid_korean_result(seg["raw_text"], fb, dict_map):
                     checkpoint_map[seg_id] = fb
             if progress_callback:
                 progress_callback(current_batch_num, total_batches)
@@ -811,11 +974,12 @@ def refine_subtitles_with_llm(
         if dict_map and ref:
             ref = apply_dictionary_postprocess(raw, ref, dict_map)
             seg["refined_text"] = ref
-        if not is_valid_korean_result(raw, ref):
+        if not is_valid_korean_result(raw, ref, dict_map):
             untranslated_count += 1
-            fixed = refine_single_segment_fallback(client, seg["index"], raw, dict_map)
+            fixed = refine_single_segment_fallback(client, seg["index"], raw, dict_map, source_lang_hint)
             seg["refined_text"] = fixed
-            checkpoint_map[seg["index"]] = fixed
+            if is_valid_korean_result(raw, fixed, dict_map):
+                checkpoint_map[seg["index"]] = fixed
 
     if untranslated_count > 0:
         logger.info(f"Completed final verification pass: corrected {untranslated_count} remaining segments to Korean.")

@@ -133,6 +133,82 @@ _LOCAL_MEDIA_INDEX: Dict[str, Path] = {}
 _LOCAL_MEDIA_ALL_PATHS: List[Any] = []
 _LOCAL_MEDIA_INDEX_TS: float = 0.0
 _auto_start_lock = threading.Lock()
+_preview_gen_in_progress: set[str] = set()
+_preview_gen_lock = threading.Lock()
+
+_SRT_FALLBACK_ENCODINGS = (
+    "utf-8-sig",
+    "utf-8",
+    "utf-16",
+    "cp949",
+    "euc-kr",
+    "gb18030",
+    "big5",
+    "shift_jis",
+    "cp1252",
+    "latin-1",
+)
+
+
+def parse_srt_segments_multi_encoding(srt_file: Any) -> List[Dict[str, Any]]:
+    """
+    Parses an .srt file from disk supporting UTF-8, UTF-16, CP949/EUC-KR, GB18030, CP1252, etc.
+    Returns normalized subtitle segment dicts ready for SubtitleSegment / API serialization.
+    """
+    srt_file = Path(srt_file)
+    raw_bytes = srt_file.read_bytes()
+    content_str: Optional[str] = None
+    for enc in _SRT_FALLBACK_ENCODINGS:
+        try:
+            decoded = raw_bytes.decode(enc)
+            # Reject UTF-16 mis-decodes if no SRT arrow token is present
+            if "-->" not in decoded:
+                continue
+            content_str = decoded
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    if content_str is None:
+        content_str = raw_bytes.decode("utf-8", errors="replace")
+
+    subs_pysrt = pysrt.from_string(content_str)
+    segments: List[Dict[str, Any]] = []
+    for idx, sub in enumerate(subs_pysrt, start=1):
+        start_sec = sub.start.ordinal / 1000.0
+        end_sec = sub.end.ordinal / 1000.0
+        start_str = str(sub.start).replace(".", ",")
+        end_str = str(sub.end).replace(".", ",")
+        segments.append({
+            "index": sub.index or idx,
+            "start": start_sec,
+            "end": end_sec,
+            "start_str": start_str,
+            "end_str": end_str,
+            "start_time_str": start_str,
+            "end_time_str": end_str,
+            "text": sub.text,
+            "raw_text": sub.text,
+            "refined_text": sub.text,
+        })
+    return segments
+
+
+def schedule_web_preview(task_id: str, video_path: Path, preview_path: Path) -> None:
+    """Starts non-blocking background web-preview generation once per task_id."""
+    with _preview_gen_lock:
+        if task_id in _preview_gen_in_progress or preview_path.exists():
+            return
+        _preview_gen_in_progress.add(task_id)
+
+    def _worker():
+        try:
+            generate_web_preview(video_path, preview_path)
+        finally:
+            with _preview_gen_lock:
+                _preview_gen_in_progress.discard(task_id)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 VALID_VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
@@ -600,80 +676,106 @@ async def sync_completed_tasks_from_disk_endpoint():
     return await run_in_threadpool(db.sync_disk_srt_to_completed_tasks)
 
 
+def _restore_task_status_sync(task_id: str) -> Optional[TaskStatus]:
+    """Synchronously restores a TaskStatus from DB (transm_tasks / completed_tasks) or disk state."""
+    try:
+        db_task = db.get_task(task_id)
+        if not db_task:
+            from sqlalchemy import text
+            with db.get_engine().connect() as conn:
+                comp = conn.execute(
+                    text("SELECT task_id, filename, srt_path, srt_download_url FROM completed_tasks WHERE task_id = :tid"),
+                    {"tid": task_id},
+                ).mappings().first()
+                if comp:
+                    db_task = {
+                        "task_id": comp["task_id"],
+                        "filename": comp["filename"],
+                        "status": "COMPLETED",
+                        "stage": "작업 완료",
+                        "progress": 100,
+                        "srt_path": comp.get("srt_path"),
+                        "srt_download_url": comp.get("srt_download_url"),
+                        "video_path": None,
+                        "error": None,
+                        "subtitles": None,
+                    }
+
+        if db_task:
+            subs = []
+            if db_task.get("subtitles"):
+                subs_raw = db_task["subtitles"]
+                if isinstance(subs_raw, str):
+                    subs_raw = json.loads(subs_raw)
+                subs = [SubtitleSegment(**s) for s in subs_raw]
+
+            srt_file = None
+            if db_task.get("srt_path") and Path(db_task["srt_path"]).exists():
+                srt_file = Path(db_task["srt_path"])
+            elif (PROCESSED_DIR / f"{task_id}.srt").exists():
+                srt_file = PROCESSED_DIR / f"{task_id}.srt"
+
+            if srt_file:
+                task_srt_paths[task_id] = srt_file
+                if not subs:
+                    try:
+                        parsed_segs = parse_srt_segments_multi_encoding(srt_file)
+                        subs = [SubtitleSegment(**s) for s in parsed_segs]
+                    except Exception as parse_err:
+                        logger.warning(f"Could not parse srt file {srt_file} for task {task_id}: {parse_err}")
+
+            if db_task.get("video_path") and Path(db_task["video_path"]).exists():
+                task_video_paths[task_id] = Path(db_task["video_path"])
+
+            task = TaskStatus(
+                task_id=db_task["task_id"],
+                filename=db_task["filename"],
+                status=db_task["status"],
+                stage=db_task["stage"] or "",
+                progress=db_task["progress"],
+                video_url=f"/api/video/{task_id}",
+                srt_download_url=db_task.get("srt_download_url") or f"/api/download/{task_id}",
+                error=db_task.get("error"),
+                subtitles=subs,
+            )
+            tasks[task_id] = task
+            return task
+    except Exception as e:
+        logger.warning(f"Failed to restore task {task_id} from PostgreSQL: {e}")
+
+    # Fallback to local persistent disk state
+    state_file = PROCESSED_DIR / f"{task_id}_state.json"
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                task_dict = json.load(f)
+            tasks[task_id] = TaskStatus(**task_dict)
+            srt_path = PROCESSED_DIR / f"{task_id}.srt"
+            if srt_path.exists():
+                task_srt_paths[task_id] = srt_path
+            return tasks[task_id]
+        except Exception as e:
+            logger.warning(f"Could not restore state from {state_file}: {e}")
+
+    return None
+
+
 @router.get("/tasks/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
     """Returns task execution progress, stage, and subtitle segments from memory, DB, or disk."""
-    if task_id not in tasks:
-        # 1. Attempt to restore from PostgreSQL database
-        try:
-            db_task = db.get_task(task_id)
-            if db_task:
-                subs = []
-                if db_task.get("subtitles"):
-                    subs_raw = db_task["subtitles"]
-                    if isinstance(subs_raw, str):
-                        subs_raw = json.loads(subs_raw)
-                    subs = [SubtitleSegment(**s) for s in subs_raw]
+    cached = tasks.get(task_id)
+    if cached is not None:
+        # Recover if earlier load cached empty subtitles while an .srt file exists on disk
+        if cached.status == "COMPLETED" and not cached.subtitles:
+            restored = await run_in_threadpool(_restore_task_status_sync, task_id)
+            if restored:
+                return restored
+        return cached
 
-                srt_file = None
-                if db_task.get("srt_path") and Path(db_task["srt_path"]).exists():
-                    srt_file = Path(db_task["srt_path"])
-                elif (PROCESSED_DIR / f"{task_id}.srt").exists():
-                    srt_file = PROCESSED_DIR / f"{task_id}.srt"
-
-                if srt_file:
-                    task_srt_paths[task_id] = srt_file
-                    if not subs:
-                        try:
-                            subs_pysrt = pysrt.open(str(srt_file), encoding="utf-8")
-                            for idx, sub in enumerate(subs_pysrt, start=1):
-                                start_s = sub.start.ordinal / 1000.0
-                                end_s = sub.end.ordinal / 1000.0
-                                subs.append(SubtitleSegment(
-                                    index=idx,
-                                    start=start_s,
-                                    end=end_s,
-                                    text=sub.text
-                                ))
-                        except Exception as parse_err:
-                            logger.warning(f"Could not parse srt file {srt_file} for task {task_id}: {parse_err}")
-
-                if db_task.get("video_path") and Path(db_task["video_path"]).exists():
-                    task_video_paths[task_id] = Path(db_task["video_path"])
-
-                task = TaskStatus(
-                    task_id=db_task["task_id"],
-                    filename=db_task["filename"],
-                    status=db_task["status"],
-                    stage=db_task["stage"] or "",
-                    progress=db_task["progress"],
-                    video_url=f"/api/video/{task_id}",
-                    srt_download_url=db_task.get("srt_download_url") or f"/api/download/{task_id}",
-                    error=db_task.get("error"),
-                    subtitles=subs
-                )
-                tasks[task_id] = task
-                return task
-        except Exception as e:
-            logger.warning(f"Failed to restore task {task_id} from PostgreSQL: {e}")
-
-        # 2. Fallback to local persistent disk state
-        state_file = PROCESSED_DIR / f"{task_id}_state.json"
-        if state_file.exists():
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    task_dict = json.load(f)
-                tasks[task_id] = TaskStatus(**task_dict)
-                srt_path = PROCESSED_DIR / f"{task_id}.srt"
-                if srt_path.exists():
-                    task_srt_paths[task_id] = srt_path
-                return tasks[task_id]
-            except Exception as e:
-                logger.warning(f"Could not restore state from {state_file}: {e}")
-
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return tasks[task_id]
+    restored = await run_in_threadpool(_restore_task_status_sync, task_id)
+    if restored is not None:
+        return restored
+    raise HTTPException(status_code=404, detail="Task not found")
 
 
 @router.post("/tasks/{task_id}/resume", response_model=Dict[str, str])
@@ -1001,7 +1103,7 @@ async def get_video(task_id: str):
     if preview_path.exists() and preview_path.stat().st_size > 0:
         return FileResponse(path=preview_path, media_type="video/mp4")
 
-    # 2. Locate original uploaded video
+    # 2. Locate original uploaded or indexed video without blocking event loop
     video_path = task_video_paths.get(task_id)
     if not video_path or not video_path.exists():
         matches = list(UPLOAD_DIR.glob(f"{task_id}_*"))
@@ -1015,8 +1117,9 @@ async def get_video(task_id: str):
                     task = await get_task_status(task_id)
                 except Exception:
                     task = None
-            if task and task.filename:
-                found = find_video_file_on_server(task.filename)
+            video_path = task_video_paths.get(task_id)
+            if (not video_path or not video_path.exists()) and task and task.filename:
+                found = await run_in_threadpool(find_video_file_on_server, task.filename)
                 if found and found.exists():
                     video_path = found
                     task_video_paths[task_id] = video_path
@@ -1025,12 +1128,12 @@ async def get_video(task_id: str):
         raise HTTPException(status_code=404, detail="Video file not found")
 
     ext = video_path.suffix.lower()
-    # 3. If WMV/ASF/AVI, generate preview if missing, else serve with appropriate MIME
+    # 3. If WMV/ASF/AVI, kick off non-blocking background preview generation and return immediately
     if ext in ['.wmv', '.asf', '.avi']:
         if not preview_path.exists():
-            generate_web_preview(video_path, preview_path)
-            if preview_path.exists() and preview_path.stat().st_size > 0:
-                return FileResponse(path=preview_path, media_type="video/mp4")
+            schedule_web_preview(task_id, video_path, preview_path)
+        else:
+            return FileResponse(path=preview_path, media_type="video/mp4")
         mime = "video/x-ms-wmv" if ext in ['.wmv', '.asf'] else "video/x-msvideo"
         return FileResponse(path=video_path, media_type=mime)
 
@@ -1314,24 +1417,7 @@ def load_segments_from_task(task_id: str) -> tuple[str, List[Dict[str, Any]]]:
 
     if srt_file.exists():
         try:
-            subs = pysrt.open(str(srt_file), encoding='utf-8')
-            for sub in subs:
-                start_sec = sub.start.ordinal / 1000.0
-                end_sec = sub.end.ordinal / 1000.0
-                start_str = str(sub.start).replace(".", ",")
-                end_str = str(sub.end).replace(".", ",")
-                segments.append({
-                    "index": sub.index,
-                    "start": start_sec,
-                    "end": end_sec,
-                    "start_str": start_str,
-                    "end_str": end_str,
-                    "start_time_str": start_str,
-                    "end_time_str": end_str,
-                    "text": sub.text,
-                    "raw_text": sub.text,
-                    "refined_text": sub.text,
-                })
+            segments.extend(parse_srt_segments_multi_encoding(srt_file))
         except Exception as e:
             logger.warning(f"Error parsing srt file on disk: {e}")
 

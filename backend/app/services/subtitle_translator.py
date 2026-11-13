@@ -117,13 +117,13 @@ def is_foreign_text(text: str) -> bool:
     return bool(RE_CHINESE.search(text) or RE_JAPANESE.search(text))
 
 
-def is_valid_translation_result(original: str, result: str, target_lang: str) -> bool:
+def is_valid_translation_result(original: str, result: str, target_lang: str, dict_map: Optional[Dict[str, str]] = None) -> bool:
     """Validates that translation actually produced clean text in target language."""
     if not result or not str(result).strip():
         return False
     res_str = str(result).strip()
     if target_lang == "ko":
-        return is_valid_korean_result(original, res_str)
+        return is_valid_korean_result(original, res_str, dict_map)
     return True
 
 
@@ -184,7 +184,7 @@ def translate_single_segment_fallback(
             if dict_map:
                 candidate = apply_dictionary_postprocess(orig_clean, candidate, dict_map)
 
-            if candidate and is_valid_translation_result(orig_clean, candidate, target_lang):
+            if candidate and is_valid_translation_result(orig_clean, candidate, target_lang, dict_map):
                 return candidate
         except Exception as e:
             logger.warning(f"Single segment translation fallback failed for #{seg_id} (attempt {attempt + 1}): {e}")
@@ -254,7 +254,7 @@ def translate_batch(
                 candidate = sanitize_subtitle_text(orig, candidate)
             # Apply Proper Noun Dictionary replacement
             candidate = apply_dictionary_postprocess(orig, candidate, dict_map)
-            if is_valid_translation_result(orig, candidate, target_lang):
+            if is_valid_translation_result(orig, candidate, target_lang, dict_map):
                 result_map[sid] = candidate
             else:
                 logger.info(f"Segment #{sid} invalid translation '{candidate}'. Retrying individually.")
@@ -278,7 +278,7 @@ def filter_clean_trans_checkpoint(
         orig_text = (orig_seg.get("refined_text") or orig_seg.get("text") or orig_seg.get("raw_text") or "") if orig_seg else ""
         sanitized = sanitize_subtitle_text(orig_text, val) if target_lang == "ko" else val
         sanitized = apply_dictionary_postprocess(orig_text, sanitized, dict_map)
-        if is_valid_translation_result(orig_text, sanitized, target_lang):
+        if is_valid_translation_result(orig_text, sanitized, target_lang, dict_map):
             clean[sid] = sanitized
         else:
             logger.info(f"Purging invalid/untranslated translation checkpoint #{sid}: '{val}'")

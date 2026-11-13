@@ -978,7 +978,6 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
     and registers any missing ones into completed_tasks and transm_tasks with correct subtitle counts.
     Ensures that previously completed subtitles are never lost and remain accessible in the Completed Tasks Archive.
     """
-    import glob
     import uuid
     import re
     from app.config import get_media_scan_dirs, PROCESSED_DIR
@@ -989,11 +988,20 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
     dirs.append(PROCESSED_DIR)
 
     discovered = []
+    seen_resolved = set()
     for d in dirs:
-        if Path(d).exists():
+        root_p = Path(d)
+        if root_p.exists() and root_p.is_dir():
             try:
-                for s in glob.glob(os.path.join(str(d), '**/*.srt'), recursive=True):
-                    discovered.append(Path(s))
+                for srt_p in root_p.rglob("*.srt"):
+                    if srt_p.is_file():
+                        try:
+                            res_str = str(srt_p.resolve())
+                        except Exception:
+                            res_str = str(srt_p)
+                        if res_str not in seen_resolved:
+                            seen_resolved.add(res_str)
+                            discovered.append(srt_p)
             except Exception as e:
                 logger.warning(f"Error scanning {d} for .srt files: {e}")
 
@@ -1018,8 +1026,16 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
 
             sub_count = 0
             try:
-                with open(srt_p, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
+                raw_bytes = srt_p.read_bytes()
+                content = None
+                for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'cp949', 'euc-kr', 'gb18030', 'cp1252', 'latin-1'):
+                    try:
+                        content = raw_bytes.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if content is None:
+                    content = raw_bytes.decode('utf-8', errors='ignore')
                 sub_count = len(re.findall(r'^\d+\s*$', content, re.MULTILINE))
             except Exception:
                 sub_count = 1

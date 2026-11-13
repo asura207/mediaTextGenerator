@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   FileCheck,
   Download,
@@ -55,6 +55,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const [isBatchDownloadingUndownloaded, setIsBatchDownloadingUndownloaded] = useState(false);
   const [isSyncingDisk, setIsSyncingDisk] = useState(false);
   const playerRef = useRef(null);
+  const queryClient = useQueryClient();
 
   // Fetch completed tasks from PostgreSQL
   const { data: tasks, isLoading, refetch, isFetching } = useQuery({
@@ -64,7 +65,13 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   });
 
   // Fetch details for selected completed task
-  const { data: detailTask, isLoading: loadingDetail } = useQuery({
+  const {
+    data: detailTask,
+    isLoading: loadingDetail,
+    isError: isDetailError,
+    error: detailError,
+    refetch: refetchDetail,
+  } = useQuery({
     queryKey: ['task', selectedDetailTaskId],
     queryFn: () => getTaskStatus(selectedDetailTaskId),
     enabled: !!selectedDetailTaskId,
@@ -580,6 +587,34 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
           <div className="h-64 bg-slate-900/60 rounded-2xl animate-pulse border border-slate-800" />
         )}
 
+        {/* Error / empty detail fallback */}
+        {!loadingDetail && (isDetailError || !detailTask) && (
+          <div className="p-8 rounded-2xl bg-slate-900/80 border border-rose-500/30 text-center space-y-4">
+            <p className="text-base font-semibold text-rose-300">
+              작업 상세 정보를 불러오지 못했습니다.
+            </p>
+            <p className="text-sm text-slate-400">
+              {detailError?.response?.data?.detail ||
+                detailError?.message ||
+                '서버에서 작업 데이터를 찾을 수 없거나 응답이 지연되었습니다.'}
+            </p>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={() => refetchDetail()}
+                className="px-4 py-2 rounded-lg bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium transition-colors"
+              >
+                다시 시도
+              </button>
+              <button
+                onClick={() => setSelectedDetailTaskId(null)}
+                className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors"
+              >
+                목록으로 돌아가기
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Detail view contents */}
         {detailTask && (
           <div className="space-y-6">
@@ -618,11 +653,15 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
                   onSeekVideo={handleSeekVideo}
                   onReset={() => setSelectedDetailTaskId(null)}
                   onSubtitlesUpdated={(newSubs) => {
-                    setDetailTask((prev) => ({
-                      ...prev,
-                      subtitles: newSubs,
-                      subtitle_count: newSubs.length,
-                    }));
+                    queryClient.setQueryData(['task', selectedDetailTaskId], (prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            subtitles: newSubs,
+                            subtitle_count: newSubs.length,
+                          }
+                        : prev
+                    );
                     refetch();
                   }}
                 />
