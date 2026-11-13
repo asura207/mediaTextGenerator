@@ -13,7 +13,8 @@ import { notifyTaskCompleted } from './utils/notification';
 import { CheckCircle2, BellRing, X, ExternalLink } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('studio'); // 'studio' | 'translate' | 'completed' | 'settings'
+  const [activeTab, setActiveTab] = useState('studio'); // 'studio' | 'translate' | 'completed' | 'settings' | 'dictionary'
+  const [menuResetKey, setMenuResetKey] = useState(0);
   const [translateTargetTaskId, setTranslateTargetTaskId] = useState(null);
   const [recentlyCompletedNotice, setRecentlyCompletedNotice] = useState(null);
   const [toastNotice, setToastNotice] = useState(null);
@@ -48,7 +49,16 @@ export default function App() {
       }
     };
     window.addEventListener('transm_task_completed', handleTaskCompleted);
-    return () => {
+    const handleMenuSelect = (tab) => {
+    setActiveTab(tab);
+    if (tab === 'translate') {
+      setTranslateTargetTaskId(null);
+    }
+    setMenuResetKey((prev) => prev + 1);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  return () => {
       window.removeEventListener('transm_task_completed', handleTaskCompleted);
       if (timer) clearTimeout(timer);
     };
@@ -88,6 +98,15 @@ export default function App() {
       });
     }
   });
+
+  const handleMenuSelect = (tab) => {
+    setActiveTab(tab);
+    if (tab === 'translate') {
+      setTranslateTargetTaskId(null);
+    }
+    setMenuResetKey((prev) => prev + 1);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   return (
     <div className="min-h-screen flex bg-slate-950 text-slate-100 font-sans relative">
@@ -130,7 +149,7 @@ export default function App() {
                 if (typeof toastNotice.onClick === 'function') {
                   toastNotice.onClick();
                 } else {
-                  setActiveTab('completed');
+                  handleMenuSelect('completed');
                 }
                 setToastNotice(null);
               }}
@@ -146,9 +165,7 @@ export default function App() {
       {/* 1. Left Vertical Sidebar Navigation */}
       <Sidebar
         activeTab={activeTab}
-        onTabChange={(tab) => {
-          setActiveTab(tab);
-        }}
+        onTabChange={handleMenuSelect}
         completedCount={completedTasks?.length || 0}
         studioQueue={studioQueue}
         translatorQueue={translatorQueue}
@@ -161,7 +178,8 @@ export default function App() {
           {/* TAB 1: Completed Tasks Archive (List & Interactive Detail View) */}
           {activeTab === 'completed' && (
             <CompletedList
-              onNewTask={() => setActiveTab('studio')}
+              key={`completed-${menuResetKey}`}
+              onNewTask={() => handleMenuSelect('studio')}
               onTranslateTask={(tid) => {
                 setTranslateTargetTaskId(tid);
                 const chosen = completedTasks?.find((t) => t.task_id === tid);
@@ -174,10 +192,11 @@ export default function App() {
           {/* TAB 2: Subtitle Translator (Language Auto-detection & Ollama Translation) */}
           {activeTab === 'translate' && (
             <SubtitleTranslator
+              key={`translate-${menuResetKey}`}
               initialTaskId={translateTargetTaskId}
               translatorQueue={translatorQueue}
               onOpenInStudio={() => {
-                setActiveTab('completed');
+                handleMenuSelect('completed');
               }}
             />
           )}
@@ -185,6 +204,7 @@ export default function App() {
           {/* TAB 4: Admin & System Engine Settings */}
           {activeTab === 'settings' && (
             <AdminSettings
+              key={`settings-${menuResetKey}`}
               onSettingsUpdated={(newSettings) => {
                 setSystemSettings(newSettings);
               }}
@@ -193,7 +213,7 @@ export default function App() {
 
           {/* TAB 5: Proper Noun Dictionary (고유명사 사전) */}
           {activeTab === 'dictionary' && (
-            <ProperNounDictionary />
+            <ProperNounDictionary key={`dictionary-${menuResetKey}`} />
           )}
 
           {/* TAB 3: Subtitle Creation Studio (Queue Dashboard & Deferred Upload) */}
@@ -241,6 +261,7 @@ export default function App() {
                   </p>
                 </div>
                 <VideoUploader
+                  key={`studio-${menuResetKey}`}
                   queue={studioQueue.queue}
                   activeItem={studioQueue.activeItem}
                   waitingCount={studioQueue.waitingCount}
@@ -250,7 +271,7 @@ export default function App() {
                   onAddServerFolder={studioQueue.addServerFolder}
                   onRemoveItem={studioQueue.removeQueueItem}
                   onClearCompleted={studioQueue.clearCompleted}
-                  onViewCompleted={() => setActiveTab('completed')}
+                  onViewCompleted={() => handleMenuSelect('completed')}
                 />
               </div>
             </div>
