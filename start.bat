@@ -63,6 +63,15 @@ rem 4. 백엔드 서버 실행 [FastAPI :8000]
 echo [*] Starting Backend Server [FastAPI on Port 8000]...
 start "TransM - Backend API" /D "%~dp0backend" cmd /k "call start_backend.bat"
 
+rem 4-1. 백엔드 포트(8000) 바인딩 대기 (프론트엔드 Proxy ECONNREFUSED 방지)
+echo [*] Waiting for Backend API [Port 8000] to become ready...
+for /L %%i in (1,1,15) do (
+    netstat -aon 2>nul | findstr ":8000" | findstr "LISTENING" >nul
+    if not errorlevel 1 goto :backend_ready
+    ping 127.0.0.1 -n 2 >nul
+)
+:backend_ready
+
 rem 5. 프론트엔드 서버 실행 [Vite :5173]
 set "DEV_FRONTEND=0"
 where npm >nul 2>&1
