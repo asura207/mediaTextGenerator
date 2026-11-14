@@ -31,13 +31,14 @@ def is_sqlite_db() -> bool:
 
 
 def _configure_sqlite_pragma(engine: Engine):
-    """Configures SQLite connection settings for high concurrency and performance."""
+    """Configures SQLite connection settings for high concurrency and lock resistance."""
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA busy_timeout=5000;")
+        cursor.execute("PRAGMA busy_timeout=30000;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("PRAGMA foreign_keys=ON;")
         cursor.close()
 
 
@@ -78,7 +79,7 @@ def get_engine() -> Engine:
     if DATABASE_URL:
         if DATABASE_URL.startswith("sqlite"):
             _is_sqlite = True
-            _engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+            _engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30.0})
             _configure_sqlite_pragma(_engine)
             _connected_db_name = DATABASE_URL
             logger.info(f"Connected to custom SQLite database via DATABASE_URL: {DATABASE_URL}")
@@ -104,7 +105,7 @@ def get_engine() -> Engine:
         db_url = f"sqlite:///{sqlite_file.as_posix()}"
         _engine = create_engine(
             db_url,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30.0},
         )
         _configure_sqlite_pragma(_engine)
         _connected_db_name = str(sqlite_file)
@@ -157,7 +158,7 @@ def get_engine() -> Engine:
     db_url = f"sqlite:///{sqlite_file.as_posix()}"
     _engine = create_engine(
         db_url,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 30.0},
     )
     _configure_sqlite_pragma(_engine)
     _connected_db_name = str(sqlite_file)
@@ -1199,7 +1200,7 @@ def add_dictionary_entry(source_word: str, target_word: str, notes: Optional[str
 
 
 def update_dictionary_entry(entry_id: int, source_word: str, target_word: str, notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Updates an existing dictionary entry by ID."""
+    """Updates an existing dictionary entry by ID with duplicate source_word conflict protection."""
     engine = get_engine()
     s_word = source_word.strip()
     t_word = target_word.strip()
@@ -1212,6 +1213,12 @@ def update_dictionary_entry(entry_id: int, source_word: str, target_word: str, n
     WHERE id = :id;
     """
     with engine.begin() as conn:
+        dup = conn.execute(
+            text("SELECT id FROM proper_noun_dictionary WHERE source_word = :src AND id != :id"),
+            {"src": s_word, "id": entry_id}
+        ).scalar()
+        if dup is not None:
+            raise ValueError(f"이미 등록된 원문 단어입니다: '{s_word}'")
         conn.execute(text(sql), {"id": entry_id, "src": s_word, "tgt": t_word, "notes": notes or ""})
 
     with engine.connect() as conn:

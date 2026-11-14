@@ -93,11 +93,11 @@ def mask_api_key(key: Optional[str]) -> str:
 
 
 def is_masked_key(key: Optional[str]) -> bool:
-    """Detects whether a key string is an already-masked placeholder."""
+    """Detects whether a key string is an already-masked placeholder (including sk-...abcd with hyphens)."""
     if not key:
         return False
     k = str(key).strip()
-    return bool(re.search(r"^\*{4,}|^\w{1,6}\.\.\.\w{1,6}$", k))
+    return bool(re.search(r"^\*{4,}|^[\w\-]{1,12}\.\.\.[\w\-]{1,12}$", k))
 
 
 # Runtime Dynamic Settings Cache

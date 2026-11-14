@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -133,13 +133,26 @@ async def health_check():
 # Serve frontend build from FastAPI for seamless single-port access (http://localhost:8000)
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 if FRONTEND_DIST.exists():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    assets_dir = FRONTEND_DIST / "assets"
+    if assets_dir.exists() and assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        if full_path.startswith("api") or full_path in ["healthz", "docs", "openapi.json", "redoc"]:
-            return None
-        file_path = FRONTEND_DIST / full_path
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(FRONTEND_DIST / "index.html")
+        clean_path = full_path.strip("/")
+        if clean_path == "api" or clean_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        if clean_path in ("healthz", "docs", "openapi.json", "redoc"):
+            raise HTTPException(status_code=404, detail="Not found")
+        if clean_path:
+            try:
+                dist_root = FRONTEND_DIST.resolve()
+                file_path = (FRONTEND_DIST / clean_path).resolve()
+                if str(file_path).startswith(str(dist_root)) and file_path.exists() and file_path.is_file():
+                    return FileResponse(file_path)
+            except Exception:
+                pass
+        index_html = FRONTEND_DIST / "index.html"
+        if index_html.exists():
+            return FileResponse(index_html)
+        raise HTTPException(status_code=404, detail="Frontend build (index.html) not found")

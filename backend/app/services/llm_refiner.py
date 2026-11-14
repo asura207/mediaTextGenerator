@@ -450,17 +450,86 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
 
     return fast_translate_short(raw_s) or "..."
 
+RE_SRT_TAG = re.compile(r"</?[ibuIBU]>|<font[^>]*>|</font>|\{\\an\d\}")
+
+
+def _has_korean_batchim(word: str) -> Optional[bool]:
+    """Returns True if the last Hangul syllable of word has a final consonant (받침), False if not, None if not Hangul."""
+    w = RE_SRT_TAG.sub("", str(word or "")).strip()
+    if not w:
+        return None
+    last_ch = w[-1]
+    code = ord(last_ch)
+    if 0xAC00 <= code <= 0xD7A3:
+        return ((code - 0xAC00) % 28) != 0
+    return None
+
+
+def _harmonize_korean_josa(text: str, target_word: str) -> str:
+    """Fixes Korean postpositions (은/는, 이/가, 을/를, 과/와) immediately following a replaced proper noun."""
+    has_batchim = _has_korean_batchim(target_word)
+    if has_batchim is None:
+        return text
+    esc = re.escape(target_word)
+    if has_batchim:
+        # Word ends with batchim: 는->은, 가->이, 를->을, 와->과
+        josa_map = {"는": "은", "가": "이", "를": "을", "와": "과"}
+    else:
+        # Word ends without batchim: 은->는, 이->가, 을->를, 과->와
+        josa_map = {"은": "는", "이": "가", "을": "를", "과": "와"}
+
+    def _repl(m: re.Match) -> str:
+        j = m.group(1)
+        return f"{target_word}{josa_map.get(j, j)}"
+
+    pattern = rf"{esc}(은|는|이|가|을|를|과|와)(?![가-힣])"
+    return re.sub(pattern, _repl, text)
+
+
+def _match_proper_noun_in_text(src: str, text: str) -> bool:
+    """
+    Checks whether a proper noun `src` genuinely appears in `text` without false partial-word matches.
+    - For ASCII words, enforces word boundaries (?<![A-Za-z0-9_])...(?![A-Za-z0-9_]).
+    - For short capitalized ASCII words (<= 3 chars like 'Al', 'In', 'An', 'Ed'), enforces case-sensitive match
+      so common lowercase words ('in', 'an') are never falsely matched.
+    """
+    if not src or not text:
+        return False
+    clean_text = RE_SRT_TAG.sub(" ", text)
+    if src.isascii() and any(ch.isalpha() for ch in src):
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(src)}(?:'s)?(?![A-Za-z0-9_])"
+        flags = 0 if (len(src) <= 3 and src[0].isupper()) else re.IGNORECASE
+        return bool(re.search(pattern, clean_text, flags=flags))
+    return src in clean_text
+
+
 def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict[str, str]) -> str:
-    """Ensures registered proper nouns are accurately mapped into the refined text."""
+    """
+    Ensures registered proper nouns are accurately mapped into the refined text:
+    - Sorts dictionary keys by length descending so multi-word proper nouns match before shorter substrings.
+    - Uses word-boundary matching for ASCII proper nouns to prevent false partial-word replacements.
+    - Harmonizes trailing Korean particles (은/는, 이/가, 을/를, 과/와) after replacement.
+    """
     if not orig_text or not trans_text or not dict_map:
         return trans_text
     res = trans_text
-    orig_lower = orig_text.lower()
-    for src, tgt in dict_map.items():
-        if src in orig_text and src in res:
-            res = res.replace(src, tgt)
-        elif src.isascii() and src.lower() in orig_lower and src.lower() in res.lower():
-            res = re.sub(re.escape(src), tgt, res, flags=re.IGNORECASE)
+    # Sort longest source words first to prevent partial overshadowing
+    sorted_items = sorted(dict_map.items(), key=lambda kv: len(kv[0] or ""), reverse=True)
+    for src, tgt in sorted_items:
+        if not src or not tgt:
+            continue
+        if not _match_proper_noun_in_text(src, orig_text):
+            continue
+        if src.isascii() and any(ch.isalpha() for ch in src):
+            pattern = rf"(?<![<A-Za-z0-9_/]){re.escape(src)}(?:'s)?(?![A-Za-z0-9_>])"
+            flags = 0 if (len(src) <= 3 and src[0].isupper()) else re.IGNORECASE
+            if re.search(pattern, res, flags=flags):
+                res = re.sub(pattern, tgt, res, flags=flags)
+                res = _harmonize_korean_josa(res, tgt)
+        else:
+            if src in res:
+                res = res.replace(src, tgt)
+                res = _harmonize_korean_josa(res, tgt)
     return res
 
 
@@ -480,15 +549,15 @@ def detect_batch_source_language(segments: List[Dict[str, Any]]) -> str:
 
 
 def build_refiner_dict_section(batch_segments: List[Dict[str, Any]], dict_map: Dict[str, str]) -> str:
-    """Builds [고유명사 사전] section for matched terms in the batch."""
+    """Builds [고유명사 사전] section for matched terms in the batch using boundary-aware matching."""
     if not dict_map:
         return ""
     matched: Dict[str, str] = {}
+    sorted_items = sorted(dict_map.items(), key=lambda kv: len(kv[0] or ""), reverse=True)
     for s in batch_segments:
-        txt = str(s.get("raw_text") or s.get("text") or "")
-        txt_lower = txt.lower()
-        for src, tgt in dict_map.items():
-            if src in txt or (src.isascii() and src.lower() in txt_lower):
+        txt = str(s.get("raw_text") or s.get("text") or s.get("refined_text") or "")
+        for src, tgt in sorted_items:
+            if src and tgt and _match_proper_noun_in_text(src, txt):
                 matched[src] = tgt
     if not matched:
         return ""
@@ -516,7 +585,8 @@ Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전�
    - 영어 알파벳 문장을 그대로 복사하거나 일본어/한자를 남기면 절대 안 됩니다.
 5. **감탄사, 비명, 신음, 숨소리 100% 보존 원칙 (절대 누락/삭제 금지)**:
    - 등장인물의 감탄사, 비명, 신음, 헐떡임, 놀람, 당황, 흐느낌 등 비언어적/정서적 발화(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...' 등)는 절대 생략하거나 삭제하지 말고 1:1로 온전히 살려두세요.
-6. **세그먼트 1:1 유지**:
+6. **서식 태그 및 세그먼트 1:1 유지**:
+   - 원문에 포함된 자막 서식 태그(<i>, </i>, <b>, </b> 등)는 그대로 보존하세요.
    - 전달받은 세그먼트의 번호(id)와 개수를 반드시 정확히 1:1로 유지해야 합니다. 임의로 합치거나 분리하거나 삭제하지 마세요.
 
 [출력 형식]
@@ -532,7 +602,7 @@ def is_foreign_text(text: str) -> bool:
     """Checks if text contains any non-Korean foreign script or untranslated Latin words."""
     if not text:
         return False
-    s = str(text).strip()
+    s = RE_SRT_TAG.sub(" ", str(text).strip())
     if _has_non_korean_unicode_script(s):
         return True
     if not RE_URL.match(s) and RE_LATIN_WORD.search(s):
@@ -540,10 +610,10 @@ def is_foreign_text(text: str) -> bool:
     return False
 
 def _strip_allowed_dict_latin(text: str, dict_map: Optional[Dict[str, str]]) -> str:
-    """Removes dictionary-registered Latin targets before checking for leftover untranslated English."""
+    """Removes SRT formatting tags and dictionary-registered Latin targets before checking for leftover untranslated English."""
+    cleaned = RE_SRT_TAG.sub(" ", text)
     if not dict_map:
-        return text
-    cleaned = text
+        return cleaned
     for tgt in dict_map.values():
         if tgt and any(ch.isascii() and ch.isalpha() for ch in tgt):
             cleaned = re.sub(re.escape(tgt), " ", cleaned, flags=re.IGNORECASE)

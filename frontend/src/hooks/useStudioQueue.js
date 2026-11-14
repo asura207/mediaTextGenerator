@@ -38,6 +38,8 @@ export function useStudioQueue({ onTaskCompleted }) {
 
   const isWorkingRef = useRef(false);
   const isPollingRef = useRef(false);
+  const uploadAbortControllerRef = useRef(null);
+  const uploadingItemIdRef = useRef(null);
   const clientIdRef = useRef(`client_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
   const notifiedTaskIdsRef = useRef(new Set());
 
@@ -167,15 +169,24 @@ export function useStudioQueue({ onTaskCompleted }) {
     [updateActiveItem]
   );
 
-  // Remove item from queue (syncs with backend)
+  // Remove item from queue (syncs with backend & cancels active upload if in progress)
   const removeQueueItem = useCallback((id) => {
+    if (uploadingItemIdRef.current === id && uploadAbortControllerRef.current) {
+      try {
+        uploadAbortControllerRef.current.abort();
+      } catch (_) {}
+      uploadAbortControllerRef.current = null;
+      uploadingItemIdRef.current = null;
+      isWorkingRef.current = false;
+      updateActiveItem(null);
+    }
     setQueue((prev) => {
       const next = prev.filter((item) => item.id !== id);
       queueRef.current = next;
       return next;
     });
     deleteStudioQueueItem(id).catch(() => {});
-  }, []);
+  }, [updateActiveItem]);
 
   // Clear completed or failed items (syncs with backend)
   const clearCompleted = useCallback(() => {
@@ -438,6 +449,9 @@ export function useStudioQueue({ onTaskCompleted }) {
               // Case 4A: Local client holds File object -> Stream upload on demand!
               if (fileObj) {
                 isWorkingRef.current = true;
+                const abortController = new AbortController();
+                uploadAbortControllerRef.current = abortController;
+                uploadingItemIdRef.current = nextItem.id;
 
                 // Mark as UPLOADING locally and notify server
                 currentQueue = queueRef.current.map((it) =>
@@ -449,21 +463,24 @@ export function useStudioQueue({ onTaskCompleted }) {
                 syncStudioQueue(currentQueue, clientIdRef.current).catch(() => {});
 
                 try {
-                  // Upload the file on demand (Deferred Upload)
+                  // Upload the file on demand (Deferred Upload with AbortController support)
                   const uploadRes = await uploadVideo(
                     fileObj,
                     (pct) => {
-                      if (!isMounted) return;
+                      if (!isMounted || abortController.signal.aborted) return;
                       setQueue((prev) => {
                         const next = prev.map((it) => (it.id === nextItem.id ? { ...it, uploadProgress: pct } : it));
                         queueRef.current = next;
                         return next;
                       });
+                      if (activeItemRef.current?.id === nextItem.id) {
+                        updateActiveItem({ ...activeItemRef.current, uploadProgress: pct });
+                      }
                     },
-                    { queueId: nextItem.id, relativePath: nextItem.filename }
+                    { queueId: nextItem.id, relativePath: nextItem.filename, signal: abortController.signal }
                   );
 
-                  if (!isMounted) return;
+                  if (!isMounted || abortController.signal.aborted) return;
 
                   // Transition to PROCESSING and sync taskId to server
                   currentQueue = queueRef.current.map((it) =>
@@ -485,6 +502,10 @@ export function useStudioQueue({ onTaskCompleted }) {
                   syncStudioQueue(currentQueue, clientIdRef.current).catch(() => {});
                 } catch (err) {
                   if (!isMounted) return;
+                  if (abortController.signal.aborted || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') {
+                    updateActiveItem(null);
+                    return;
+                  }
                   const uploadErrMsg = err.response?.data?.detail || err.message || '동영상 파일 업로드 실패';
                   currentQueue = queueRef.current.map((it) =>
                     it.id === nextItem.id
@@ -500,6 +521,10 @@ export function useStudioQueue({ onTaskCompleted }) {
                   updateActiveItem(null);
                   syncStudioQueue(currentQueue, clientIdRef.current).catch(() => {});
                 } finally {
+                  if (uploadingItemIdRef.current === nextItem.id) {
+                    uploadingItemIdRef.current = null;
+                    uploadAbortControllerRef.current = null;
+                  }
                   isWorkingRef.current = false;
                 }
               }

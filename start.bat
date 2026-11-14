@@ -61,7 +61,7 @@ if exist "d:\dev\tools\nodejs" (
 
 rem 4. 백엔드 서버 실행 [FastAPI :8000]
 echo [*] Starting Backend Server [FastAPI on Port 8000]...
-start "TransM - Backend API" cmd /k "cd /d "%~dp0backend" && call start_backend.bat"
+start "TransM - Backend API" /D "%~dp0backend" cmd /k "call start_backend.bat"
 
 rem 5. 프론트엔드 서버 실행 [Vite :5173]
 set "DEV_FRONTEND=0"
@@ -69,12 +69,12 @@ where npm >nul 2>&1
 if %errorlevel% equ 0 (
     if not exist "%~dp0frontend\node_modules" (
         echo [*] Frontend 의존성 [npm install] 을 진행합니다...
-        cd /d "%~dp0frontend"
+        pushd "%~dp0frontend"
         call npm install
-        cd /d "%~dp0"
+        popd
     )
     echo [*] Starting Frontend Server [Vite on Port 5173]...
-    start "TransM - Frontend Studio" cmd /k "cd /d "%~dp0frontend" && call start_frontend.bat"
+    start "TransM - Frontend Studio" /D "%~dp0frontend" cmd /k "call start_frontend.bat"
     set "DEV_FRONTEND=1"
 ) else (
     echo [INFO] Node.js가 감지되지 않아 백엔드 통합 웹 UI [Port 8000] 로 구동합니다.
@@ -94,9 +94,9 @@ echo [*] 브라우저를 띄우기 위해 잠시 대기합니다...
 
 ping 127.0.0.1 -n 6 >nul
 if "%DEV_FRONTEND%"=="1" (
-    start http://localhost:5173
+    start "" "http://localhost:5173"
 ) else (
-    start http://localhost:8000
+    start "" "http://localhost:8000"
 )
 
 echo.

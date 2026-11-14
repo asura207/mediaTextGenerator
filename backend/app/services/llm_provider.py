@@ -60,6 +60,77 @@ def _clean_json_str(content: str) -> str:
     return c
 
 
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 529}
+
+
+def _post_with_retry(
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: float,
+    provider_label: str,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """
+    Executes HTTP POST to cloud LLM provider with exponential backoff for:
+    - HTTP 429 (Rate Limit, honoring Retry-After header if present)
+    - HTTP 5xx (500, 502, 503, 504, 529 transient server errors)
+    - Network timeouts / transient socket errors (httpx.TimeoutException, httpx.RequestError)
+    Fails fast on authentication (401/403) or invalid request/context overflow (400).
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, headers=headers, json=payload)
+
+            if resp.status_code == 200:
+                return resp.json()
+
+            err_body = resp.text
+            try:
+                err_json = resp.json()
+                if isinstance(err_json.get("error"), dict):
+                    err_body = err_json["error"].get("message") or err_body
+                elif err_json.get("error"):
+                    err_body = str(err_json["error"])
+            except Exception:
+                pass
+
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries - 1:
+                retry_after = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+                wait_sec = 1.5 * (2 ** attempt)
+                if retry_after:
+                    try:
+                        wait_sec = min(15.0, max(wait_sec, float(retry_after)))
+                    except ValueError:
+                        pass
+                logger.warning(
+                    f"[{provider_label}] HTTP {resp.status_code} ({err_body[:120]}). "
+                    f"Retrying in {wait_sec:.1f}s (attempt {attempt + 1}/{max_retries})..."
+                )
+                time.sleep(wait_sec)
+                continue
+
+            if resp.status_code in (401, 403):
+                raise ValueError(f"{provider_label} 인증 오류 ({resp.status_code}): API 키가 유효하지 않거나 권한이 없습니다. ({err_body})")
+            raise RuntimeError(f"{provider_label} API 오류 ({resp.status_code}): {err_body}")
+
+        except (httpx.TimeoutException, httpx.RequestError) as net_err:
+            last_err = net_err
+            if attempt < max_retries - 1:
+                wait_sec = 1.5 * (2 ** attempt)
+                logger.warning(
+                    f"[{provider_label}] Network/Timeout error ({net_err}). "
+                    f"Retrying in {wait_sec:.1f}s (attempt {attempt + 1}/{max_retries})..."
+                )
+                time.sleep(wait_sec)
+                continue
+            raise RuntimeError(f"{provider_label} 네트워크 타임아웃/연결 오류: {net_err}") from net_err
+
+    raise RuntimeError(f"{provider_label} 호출 실패: {last_err}")
+
+
 def chat_completion(
     messages: List[Dict[str, str]],
     provider: Optional[str] = None,
@@ -69,9 +140,10 @@ def chat_completion(
     max_tokens: int = 2048,
     timeout: float = 90.0,
     api_key_override: Optional[str] = None,
+    max_retries: int = 3,
 ) -> str:
     """
-    Unified LLM chat completion caller supporting:
+    Unified LLM chat completion caller with exponential backoff retry supporting:
     - Ollama (Local)
     - OpenAI (GPT-4o, GPT-4o-mini, etc.)
     - Anthropic (Claude-3.5-Sonnet, Claude-3.5-Haiku, etc.)
@@ -83,7 +155,6 @@ def chat_completion(
     # 1. Ollama
     if p == "ollama":
         target_model = model or settings.get("ollama_model") or DEFAULT_MODELS["ollama"]
-        client = ollama.Client(host=OLLAMA_HOST, timeout=timeout)
         options: Dict[str, Any] = {
             "temperature": temperature,
             "top_p": 0.9,
@@ -100,8 +171,28 @@ def chat_completion(
         if format_json:
             kwargs["format"] = "json"
 
-        resp = client.chat(**kwargs)
-        return resp.get("message", {}).get("content", "").strip()
+        last_ollama_err: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                client = ollama.Client(host=OLLAMA_HOST, timeout=timeout)
+                resp = client.chat(**kwargs)
+                if isinstance(resp, dict):
+                    return (resp.get("message", {}).get("content") or "").strip()
+                msg_obj = getattr(resp, "message", None)
+                return (getattr(msg_obj, "content", "") or "").strip()
+            except Exception as e:
+                last_ollama_err = e
+                err_str = str(e).lower()
+                # Do not retry if model does not exist locally
+                if "not found" in err_str and "model" in err_str:
+                    raise RuntimeError(f"Ollama 모델 '{target_model}'이(가) 설치되어 있지 않습니다: {e}") from e
+                if attempt < max_retries - 1:
+                    wait_sec = 1.5 * (2 ** attempt)
+                    logger.warning(f"[Ollama] 호출 일시 오류 ({e}). {wait_sec:.1f}초 후 재시도 ({attempt + 1}/{max_retries})...")
+                    time.sleep(wait_sec)
+                    continue
+                raise RuntimeError(f"Ollama 호출 오류: {e}") from e
+        raise RuntimeError(f"Ollama 호출 실패: {last_ollama_err}")
 
     # 2. OpenAI
     elif p == "openai":
@@ -123,22 +214,18 @@ def chat_completion(
         if format_json:
             payload["response_format"] = {"type": "json_object"}
 
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-            if resp.status_code != 200:
-                err_body = resp.text
-                try:
-                    err_json = resp.json()
-                    err_body = err_json.get("error", {}).get("message", err_body)
-                except Exception:
-                    pass
-                raise RuntimeError(f"OpenAI API 오류 ({resp.status_code}): {err_body}")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise RuntimeError("OpenAI API 응답이 비어 있습니다.")
-            return choices[0].get("message", {}).get("content", "").strip()
+        data = _post_with_retry(
+            url="https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+            provider_label="OpenAI",
+            max_retries=max_retries,
+        )
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError("OpenAI API 응답이 비어 있습니다.")
+        return (choices[0].get("message", {}).get("content") or "").strip()
 
     # 3. Anthropic (Claude)
     elif p == "anthropic":
@@ -183,22 +270,18 @@ def chat_completion(
         if system_prompt:
             payload["system"] = system_prompt
 
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-            if resp.status_code != 200:
-                err_body = resp.text
-                try:
-                    err_json = resp.json()
-                    err_body = err_json.get("error", {}).get("message", err_body)
-                except Exception:
-                    pass
-                raise RuntimeError(f"Anthropic API 오류 ({resp.status_code}): {err_body}")
-
-            data = resp.json()
-            contents = data.get("content", [])
-            if not contents:
-                raise RuntimeError("Anthropic Claude 응답이 비어 있습니다.")
-            return contents[0].get("text", "").strip()
+        data = _post_with_retry(
+            url="https://api.anthropic.com/v1/messages",
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+            provider_label="Anthropic",
+            max_retries=max_retries,
+        )
+        contents = data.get("content", [])
+        if not contents:
+            raise RuntimeError("Anthropic Claude 응답이 비어 있습니다.")
+        return (contents[0].get("text") or "").strip()
 
     # 4. Google Gemini
     elif p in ("gemini", "google"):
@@ -207,15 +290,20 @@ def chat_completion(
             raise ValueError("Gemini API 키가 설정되지 않았습니다. 관리자 설정에서 API 키를 등록해 주세요.")
         target_model = model or settings.get("gemini_model") or DEFAULT_MODELS["gemini"]
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
 
-        system_instruction = None
+        system_parts: List[str] = []
         gemini_contents = []
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
             if role == "system":
-                system_instruction = {"parts": [{"text": content}]}
+                if content:
+                    system_parts.append(content)
             else:
                 gemini_role = "user" if role == "user" else "model"
                 gemini_contents.append({"role": gemini_role, "parts": [{"text": content}]})
@@ -234,28 +322,24 @@ def chat_completion(
             "contents": gemini_contents,
             "generationConfig": gen_config,
         }
-        if system_instruction:
-            payload["systemInstruction"] = system_instruction
+        if system_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
 
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, headers={"Content-Type": "application/json"}, json=payload)
-            if resp.status_code != 200:
-                err_body = resp.text
-                try:
-                    err_json = resp.json()
-                    err_body = err_json.get("error", {}).get("message", err_body)
-                except Exception:
-                    pass
-                raise RuntimeError(f"Gemini API 오류 ({resp.status_code}): {err_body}")
-
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise RuntimeError("Gemini API 응답이 비어 있습니다.")
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                raise RuntimeError("Gemini API 텍스트 본문이 비어 있습니다.")
-            return parts[0].get("text", "").strip()
+        data = _post_with_retry(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+            provider_label="Gemini",
+            max_retries=max_retries,
+        )
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini API 응답이 비어 있습니다.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            raise RuntimeError("Gemini API 텍스트 본문이 비어 있습니다.")
+        return (parts[0].get("text") or "").strip()
 
     else:
         raise ValueError(f"지원하지 않는 LLM Provider입니다: {provider}")

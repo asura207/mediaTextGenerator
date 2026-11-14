@@ -156,23 +156,11 @@ _SRT_FALLBACK_ENCODINGS = (
 
 def parse_srt_bytes_multi_encoding(raw_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Decodes raw .srt bytes across UTF-8, UTF-16, and regional encodings worldwide,
+    Decodes raw .srt bytes across UTF-8, UTF-8-SIG, UTF-16, CP949/EUC-KR, Shift-JIS, and regional encodings,
     returning normalized subtitle segment dicts.
     """
-    content_str: Optional[str] = None
-    for enc in _SRT_FALLBACK_ENCODINGS:
-        try:
-            decoded = raw_bytes.decode(enc)
-            if "-->" not in decoded:
-                continue
-            content_str = decoded
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
-
-    if content_str is None:
-        content_str = raw_bytes.decode("utf-8", errors="replace")
-
+    from app.services.language_detector import decode_subtitle_bytes
+    content_str = decode_subtitle_bytes(raw_bytes)
     subs_pysrt = pysrt.from_string(content_str)
     segments: List[Dict[str, Any]] = []
     for idx, sub in enumerate(subs_pysrt, start=1):
@@ -382,16 +370,16 @@ def auto_start_next_waiting_item(background_tasks: Optional[BackgroundTasks] = N
 
 def run_pipeline(task_id: str, video_path: Path, filename: str):
     """Asynchronous background worker executing the full subtitle pipeline with DB persistence."""
+    audio_path = PROCESSED_DIR / f"{task_id}.wav"
     try:
         # Step 1: Audio Extraction (Skip if already extracted)
-        audio_path = PROCESSED_DIR / f"{task_id}.wav"
         if audio_path.exists() and audio_path.stat().st_size > 0:
             logger.info(f"Reusing existing extracted audio: {audio_path}")
             tasks[task_id].stage = "기존 오디오 파일 재사용..."
             tasks[task_id].progress = 25
             save_task_state(task_id)
         else:
-            tasks[task_id].stage = "오디오 추출 중 (moviepy)..."
+            tasks[task_id].stage = "오디오 다이나믹 증폭 및 추출 중 (FFmpeg)..."
             tasks[task_id].progress = 25
             save_task_state(task_id)
             extract_audio(video_path, audio_path)
@@ -557,14 +545,6 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
         db.delete_studio_queue_by_task_id(task_id, filename=filename)
         logger.info(f"Task {task_id} completed successfully, saved to PostgreSQL, and removed from studio queue.")
 
-        # Clean up temporary audio file to preserve disk space
-        try:
-            if audio_path.exists():
-                audio_path.unlink(missing_ok=True)
-                logger.info(f"Temporary audio file cleaned up: {audio_path}")
-        except Exception as e_clean:
-            logger.warning(f"Could not clean up temporary audio {audio_path}: {e_clean}")
-
         # Check and auto-start next queued item immediately
         try:
             auto_start_next_waiting_item()
@@ -582,6 +562,14 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
             auto_start_next_waiting_item()
         except Exception as e_next:
             logger.warning(f"Error auto-starting next queue item on failure: {e_next}")
+    finally:
+        # Guarantee 100% temporary .wav cleanup on completion, 0-subtitle early return, or failure
+        try:
+            if audio_path.exists():
+                audio_path.unlink(missing_ok=True)
+                logger.info(f"Temporary audio file cleaned up in finally block: {audio_path}")
+        except Exception as e_clean:
+            logger.warning(f"Could not clean up temporary audio {audio_path}: {e_clean}")
 
 
 @router.post("/upload", response_model=Dict[str, str], status_code=status.HTTP_202_ACCEPTED)
@@ -912,15 +900,29 @@ async def download_srt(task_id: str):
     encoded_filename = urllib.parse.quote(download_filename, encoding="utf-8")
     content_disposition = f'attachment; filename="subtitles.srt"; filename*=UTF-8\'\'{encoded_filename}'
 
-    # Increment download count in PostgreSQL
+    # Increment download count in DB
     try:
-        db.increment_download_count(task_id)
+        await run_in_threadpool(db.increment_download_count, task_id)
     except Exception as e:
         logger.warning(f"Failed to record download count for {task_id}: {e}")
 
+    # Guarantee UTF-8 with BOM (utf-8-sig) for domestic players (Series On, PotPlayer) consistency with ZIP batch download
+    try:
+        raw_srt = srt_path.read_bytes()
+        if not raw_srt.startswith(b"\xef\xbb\xbf"):
+            from app.services.language_detector import decode_subtitle_bytes
+            decoded_srt = decode_subtitle_bytes(raw_srt)
+            raw_srt = decoded_srt.encode("utf-8-sig")
+            try:
+                srt_path.write_bytes(raw_srt)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return FileResponse(
         path=srt_path,
-        media_type="application/x-subrip",
+        media_type="application/x-subrip; charset=utf-8",
         headers={
             "Content-Disposition": content_disposition,
             "Access-Control-Expose-Headers": "Content-Disposition",
@@ -2361,7 +2363,7 @@ def _get_installed_ollama_models() -> List[Dict[str, Any]]:
 async def get_system_settings_endpoint():
     """Returns current LLM & Whisper settings and available options for Admin UI select boxes."""
     current = get_runtime_settings(mask_keys=True)
-    installed_list = _get_installed_ollama_models()
+    installed_list = await run_in_threadpool(_get_installed_ollama_models)
     installed_names = {m["name"] for m in installed_list}
 
     # Merge recommended models with installed status
@@ -2417,22 +2419,21 @@ async def update_system_settings_endpoint(
     """Updates and persists LLM & Whisper configuration immediately, optionally re-queuing completed tasks."""
     requeue_flag = payload.requeue_completed if payload.requeue_completed is not None else True
     updates = payload.model_dump(exclude_none=True, exclude={"requeue_completed"})
-    updated = update_runtime_settings(updates)
-    logger.info(f"System settings updated by user: {updated} (requeue_completed={requeue_flag})")
+    update_runtime_settings(updates)
+    masked_current = get_runtime_settings(mask_keys=True)
+    logger.info(f"System settings updated by user: {masked_current} (requeue_completed={requeue_flag})")
 
     requeue_info = None
     msg = "설정이 저장되어 즉시 적용되었습니다."
     if requeue_flag:
         try:
-            requeue_info = execute_requeue_completed_tasks(reset_processing=False, background_tasks=background_tasks)
+            requeue_info = await run_in_threadpool(execute_requeue_completed_tasks, False, background_tasks)
             rq_cnt = requeue_info.get("requeued_count", 0)
             if rq_cnt > 0:
                 msg = f"설정이 저장 및 적용되었으며, 기존 완료된 작업 {rq_cnt}건이 새 설정 기준으로 대기열에 다시 등록되었습니다."
         except Exception as e:
             logger.warning(f"Failed to auto-requeue completed tasks on settings update: {e}")
 
-    # Return masked view of updated settings
-    masked_current = get_runtime_settings(mask_keys=True)
     return {
         "message": msg,
         "current": masked_current,

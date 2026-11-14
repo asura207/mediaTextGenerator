@@ -19,10 +19,13 @@ export const uploadVideo = async (file, onUploadProgress, options = {}) => {
     headers: {
       'Content-Type': 'multipart/form-data',
     },
+    signal: options.signal,
     onUploadProgress: (progressEvent) => {
-      if (progressEvent.total) {
-        const percentCompleted = Math.round(
-          (progressEvent.loaded * 100) / progressEvent.total
+      const total = progressEvent.total || file?.size || 0;
+      if (total > 0 && typeof onUploadProgress === 'function') {
+        const percentCompleted = Math.min(
+          100,
+          Math.max(0, Math.round((progressEvent.loaded * 100) / total))
         );
         onUploadProgress(percentCompleted);
       }

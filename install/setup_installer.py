@@ -35,8 +35,10 @@ BACKEND_DIR = ROOT_DIR / "backend"
 ENV_FILE = ROOT_DIR / ".env"
 SETTINGS_FILE = BACKEND_DIR / "data" / "settings.json"
 
-# Add backend directory to sys.path so app modules can be loaded
-sys.path.insert(0, str(BACKEND_DIR))
+# Add root and backend directories to sys.path so install and app modules can be loaded regardless of CWD
+for _p in (str(ROOT_DIR), str(BACKEND_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def clear_screen():

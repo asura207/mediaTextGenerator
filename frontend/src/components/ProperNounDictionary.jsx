@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   BookOpen,
   Plus,
@@ -24,6 +25,7 @@ import {
 } from '../api/client';
 
 export default function ProperNounDictionary() {
+  const queryClient = useQueryClient();
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -59,10 +61,15 @@ export default function ProperNounDictionary() {
   const loadData = useCallback(async (targetPage = page, query = activeQuery) => {
     setLoading(true);
     try {
-      const data = await getDictionaryEntries(targetPage, size, query);
+      let data = await getDictionaryEntries(targetPage, size, query);
+      const maxPage = Math.max(1, data.total_pages || 1);
+      // If deletion or filtering left targetPage beyond maxPage, clamp to maxPage and reload
+      if (targetPage > maxPage) {
+        data = await getDictionaryEntries(maxPage, size, query);
+      }
       setItems(data.items || []);
       setTotal(data.total || 0);
-      setPage(data.page || 1);
+      setPage(data.page || maxPage);
       setTotalPages(data.total_pages || 1);
       setSelectedIds(new Set());
     } catch (err) {
@@ -130,7 +137,8 @@ export default function ProperNounDictionary() {
       });
       showToast('success', `'${formSourceWord.trim()}' 고유명사가 사전에 등록되었습니다.`);
       setShowAddModal(false);
-      loadData(page, activeQuery);
+      queryClient.invalidateQueries({ queryKey: ['dictionaryEntries'] });
+      loadData(1, activeQuery);
     } catch (err) {
       showToast('error', err.response?.data?.detail || '고유명사 등록에 실패했습니다.');
     } finally {
@@ -162,6 +170,7 @@ export default function ProperNounDictionary() {
       showToast('success', `'${formSourceWord.trim()}' 고유명사 정보가 수정되었습니다.`);
       setShowEditModal(false);
       setEditingItem(null);
+      queryClient.invalidateQueries({ queryKey: ['dictionaryEntries'] });
       loadData(page, activeQuery);
     } catch (err) {
       showToast('error', err.response?.data?.detail || '고유명사 수정에 실패했습니다.');
@@ -177,7 +186,9 @@ export default function ProperNounDictionary() {
     try {
       await deleteDictionaryEntry(id);
       showToast('success', `'${sourceWord}' 단어가 삭제되었습니다.`);
-      loadData(page, activeQuery);
+      queryClient.invalidateQueries({ queryKey: ['dictionaryEntries'] });
+      const nextTargetPage = items.length <= 1 && page > 1 ? page - 1 : page;
+      loadData(nextTargetPage, activeQuery);
     } catch (err) {
       showToast('error', err.response?.data?.detail || '단어 삭제에 실패했습니다.');
     }
@@ -189,10 +200,13 @@ export default function ProperNounDictionary() {
       return;
     }
     try {
+      const deletingAllOnPage = selectedIds.size >= items.length;
       const res = await batchDeleteDictionaryEntries(Array.from(selectedIds));
       showToast('success', `${res.deleted_count || selectedIds.size}건의 고유명사가 삭제되었습니다.`);
       setSelectedIds(new Set());
-      loadData(page, activeQuery);
+      queryClient.invalidateQueries({ queryKey: ['dictionaryEntries'] });
+      const nextTargetPage = deletingAllOnPage && page > 1 ? page - 1 : page;
+      loadData(nextTargetPage, activeQuery);
     } catch (err) {
       showToast('error', err.response?.data?.detail || '일괄 삭제에 실패했습니다.');
     }

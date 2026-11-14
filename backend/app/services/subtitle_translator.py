@@ -22,6 +22,8 @@ from app.services.llm_refiner import (
     sanitize_subtitle_text,
     is_valid_korean_result,
     is_foreign_text as refiner_is_foreign_text,
+    _match_proper_noun_in_text,
+    apply_dictionary_postprocess as refiner_apply_dictionary_postprocess,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,14 +70,15 @@ def detect_source_language_name(segments: List[Dict[str, Any]]) -> str:
 
 
 def build_dictionary_prompt_section(batch_segments: List[Dict[str, Any]], dict_map: Dict[str, str]) -> str:
-    """Builds a formatted [고유명사 사전] section if any registered source words appear in the batch."""
+    """Builds a formatted [고유명사 사전] section if any registered source words appear in the batch (word-boundary aware)."""
     if not dict_map:
         return ""
     matched: Dict[str, str] = {}
+    sorted_items = sorted(dict_map.items(), key=lambda kv: len(kv[0] or ""), reverse=True)
     for s in batch_segments:
         txt = str(s.get("refined_text") or s.get("text") or s.get("raw_text") or "")
-        for src, tgt in dict_map.items():
-            if src in txt:
+        for src, tgt in sorted_items:
+            if src and tgt and _match_proper_noun_in_text(src, txt):
                 matched[src] = tgt
     if not matched:
         return ""
@@ -89,17 +92,9 @@ def build_dictionary_prompt_section(batch_segments: List[Dict[str, Any]], dict_m
 def apply_dictionary_postprocess(orig_text: str, trans_text: str, dict_map: Dict[str, str]) -> str:
     """
     Ensures that proper nouns registered in the dictionary are accurately reflected
-    in the translated subtitle, fixing any untranslated words or dictionary mismatches.
+    in the translated subtitle using boundary-aware matching and Korean particle harmonization.
     """
-    if not orig_text or not trans_text or not dict_map:
-        return trans_text
-    res = trans_text
-    for src, tgt in dict_map.items():
-        if src in orig_text:
-            # If the original foreign term was left directly in the translation text
-            if src in res:
-                res = res.replace(src, tgt)
-    return res
+    return refiner_apply_dictionary_postprocess(orig_text, trans_text, dict_map)
 
 
 def is_foreign_text(text: str) -> bool:
