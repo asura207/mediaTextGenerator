@@ -509,15 +509,15 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
             checkpoint_path=checkpoint_path
         )
 
-        # Optimize subtitle timing so subtitles disappear when dialogue ends
-        refined_segments = optimize_subtitle_timing(refined_segments)
+        # Optimize subtitle timing once after LLM refinement (+0.3s clamped extension, 2-line overlap merge, 50ms gap)
+        refined_segments = optimize_subtitle_timing(refined_segments, apply_timing_optimization=True)
 
         # Step 4: SRT Subtitle Generation
         tasks[task_id].stage = "SRT 자막 파일 생성 중..."
         tasks[task_id].progress = 90
         save_task_state(task_id)
         srt_path = PROCESSED_DIR / f"{task_id}.srt"
-        generate_srt_file(refined_segments, srt_path)
+        generate_srt_file(refined_segments, srt_path, optimize=False, apply_timing_optimization=False)
         task_srt_paths[task_id] = srt_path
 
         # Step 5: Completion & Subtitle Persistence
@@ -817,13 +817,17 @@ async def update_subtitles(task_id: str, payload: UpdateSubtitlesRequest):
     raw_segments_dict = [sub.model_dump() for sub in payload.subtitles]
     clean_segments = [s for s in raw_segments_dict if (s.get("refined_text") or s.get("text") or s.get("raw_text") or "").strip()]
     if clean_segments:
-        segments_dict = optimize_subtitle_timing(clean_segments, extend_sec=0.0)
+        segments_dict = optimize_subtitle_timing(
+            clean_segments,
+            extend_sec=0.0,
+            apply_timing_optimization=False,
+        )
     else:
         segments_dict = []
     task.subtitles = [SubtitleSegment(**seg) for seg in segments_dict]
     
     srt_path = PROCESSED_DIR / f"{task_id}.srt"
-    generate_srt_file(segments_dict, srt_path, optimize=False)
+    generate_srt_file(segments_dict, srt_path, optimize=False, apply_timing_optimization=False)
     task_srt_paths[task_id] = srt_path
 
     # Persist updated subtitles to PostgreSQL
@@ -1324,14 +1328,19 @@ def run_translation_pipeline(
             checkpoint_callback=on_checkpoint
         )
 
-        translated = optimize_subtitle_timing(translated)
+        # Preserve existing SRT timings without duplicate +0.3s extension or re-slicing (only enforce 50ms gap & integrity)
+        translated = optimize_subtitle_timing(
+            translated,
+            extend_sec=0.0,
+            apply_timing_optimization=False,
+        )
 
         tasks[trans_task_id].stage = "번역된 SRT 파일 생성 중..."
         tasks[trans_task_id].progress = 95
         save_task_state(trans_task_id)
 
         srt_path = PROCESSED_DIR / f"{trans_task_id}.srt"
-        generate_srt_file(translated, srt_path)
+        generate_srt_file(translated, srt_path, optimize=False, apply_timing_optimization=False)
         task_srt_paths[trans_task_id] = srt_path
 
         sub_models = [SubtitleSegment(**seg) for seg in translated]

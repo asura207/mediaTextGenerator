@@ -379,38 +379,36 @@ def is_clean_korean_line(line: str, raw_text: str = "") -> bool:
     return True
 
 
-def sanitize_subtitle_text(raw_text: str, text: str) -> str:
-    """
-    Cleans LLM output by stripping CJK full-width punctuation (。，：“”「」), empty quotes (""),
-    multi-option lists, and AI conversational meta-responses, returning a single clean Korean subtitle line.
-    """
-    raw_s = str(raw_text or "").strip()
+def _sanitize_single_subtitle_line(raw_s: str, text: str) -> str:
+    """Cleans a single subtitle line by stripping CJK punctuation, empty quotes, and AI meta-notes."""
     if not text or not str(text).strip():
         return fast_translate_short(raw_s)
 
     s = str(text).strip()
+    has_bullet = bool(re.match(r"^(?:[-―—•·]+\s*)+", s)) or bool(re.match(r"^(?:[-―—•·]+\s*)+", raw_s))
+    s_core = re.sub(r"^(?:[-―—•·]+\s*)+", "", s).strip()
+    raw_core = re.sub(r"^(?:[-―—•·]+\s*)+", "", raw_s).strip()
 
     has_mess = bool(
-        RE_CJK_PUNCT.search(s)
-        or '""' in s
-        or "''" in s
-        or "\n" in s
-        or is_ai_meta_response(raw_s, s)
-        or _has_non_korean_unicode_script(s)
-        or RE_MIXED_GIBBERISH.search(s)
+        RE_CJK_PUNCT.search(s_core)
+        or '""' in s_core
+        or "''" in s_core
+        or "\n" in s_core
+        or is_ai_meta_response(raw_core, s_core)
+        or _has_non_korean_unicode_script(s_core)
+        or RE_MIXED_GIBBERISH.search(s_core)
     )
     if not has_mess:
-        return s
+        return f"- {s_core}" if (has_bullet and "\n" in raw_s) else s_core
 
     # 1. Check fast dictionary for known short CJK/Kana/EN tokens
-    fast_hit = fast_translate_short(raw_s)
+    fast_hit = fast_translate_short(raw_core)
     if fast_hit:
         return fast_hit
 
     # 2. Strip parenthetical AI notes & common prefixes ("번역 결과:")
-    s_clean = re.sub(r'\((?:번역|요청|자연스럽|순수|구어체|결과|원문|의미)[^)]*\)', ' ', s)
+    s_clean = re.sub(r'\((?:번역|요청|자연스럽|순수|구어체|결과|원문|의미)[^)]*\)', ' ', s_core)
     s_clean = re.sub(r'^(?:번역\s*결과|번역|교정\s*결과|수정\s*결과|결과)\s*[:：]\s*', '', s_clean.strip())
-    # Strip stray foreign script letters if mixed with Korean (keeping Hangul/ASCII/digits/punct)
     s_clean = _strip_non_korean_unicode_letters(s_clean)
 
     # 3. Extract quoted Korean candidates (e.g. “혼자 하는 일도”)
@@ -419,7 +417,7 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
     for qc in quoted_candidates:
         qc_clean = RE_CJK_PUNCT.sub(' ', qc).strip(" .,?!:;~-\"'")
         qc_clean = re.sub(r'\s+', ' ', qc_clean).strip()
-        if qc_clean and is_clean_korean_line(qc_clean, raw_s):
+        if qc_clean and is_clean_korean_line(qc_clean, raw_core):
             if qc.strip().endswith(("?", "？")) and not qc_clean.endswith("?"):
                 qc_clean += "?"
             elif qc.strip().endswith(("!", "！")) and not qc_clean.endswith("!"):
@@ -436,7 +434,7 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
         p_str = re.sub(r'\s+', ' ', p_str).strip()
         if not p_str:
             continue
-        if is_clean_korean_line(p_str, raw_s):
+        if is_clean_korean_line(p_str, raw_core):
             if p.strip().endswith(("?", "？")) and not p_str.endswith("?"):
                 p_str += "?"
             elif p.strip().endswith(("!", "！")) and not p_str.endswith("!"):
@@ -448,7 +446,33 @@ def sanitize_subtitle_text(raw_text: str, text: str) -> str:
     if valid_quoted:
         return valid_quoted[0]
 
-    return fast_translate_short(raw_s) or "..."
+    return fast_translate_short(raw_core) or "..."
+
+
+def sanitize_subtitle_text(raw_text: str, text: str) -> str:
+    """
+    Cleans LLM output while preserving 2-line speaker structure (- Line 1\n- Line 2)
+    when the source segment itself was a 2-line subtitle.
+    """
+    raw_s = str(raw_text or "").strip()
+    s = str(text or "").strip()
+    if "\n" in raw_s and "\n" in s:
+        raw_lines = [l.strip() for l in raw_s.splitlines() if l.strip()]
+        out_lines = [l.strip() for l in s.splitlines() if l.strip()]
+        cleaned_pair = []
+        for idx, ol in enumerate(out_lines[:2]):
+            rl = raw_lines[idx] if idx < len(raw_lines) else raw_lines[-1]
+            c_line = _sanitize_single_subtitle_line(rl, ol)
+            c_line = re.sub(r"^(?:[-―—•·]+\s*)+", "", c_line).strip()
+            if c_line:
+                cleaned_pair.append(c_line)
+        if len(cleaned_pair) == 2:
+            if any(re.match(r"^(?:[-―—•·]+\s*)+", l) for l in raw_lines + out_lines):
+                return f"- {cleaned_pair[0]}\n- {cleaned_pair[1]}"
+            return f"{cleaned_pair[0]}\n{cleaned_pair[1]}"
+        elif len(cleaned_pair) == 1:
+            return cleaned_pair[0]
+    return _sanitize_single_subtitle_line(raw_s, s)
 
 RE_SRT_TAG = re.compile(r"</?[ibuIBU]>|<font[^>]*>|</font>|\{\\an\d\}")
 
@@ -623,20 +647,35 @@ def is_valid_korean_result(original: str, result: str, dict_map: Optional[Dict[s
     """
     Verifies that the result is translated into clean Korean Hangul regardless of STT source language
     across all world Unicode scripts, with zero untranslated foreign text or AI meta-talk.
+    Supports legitimate 2-line speaker subtitles when the original segment was 2 lines.
     """
     if not result or not str(result).strip():
         return False
     res_str = str(result).strip()
+    orig_str = str(original or "").strip()
+
+    if "\n" in res_str:
+        res_lines = [l.strip() for l in res_str.splitlines() if l.strip()]
+        if "\n" not in orig_str or len(res_lines) > 2:
+            return False
+        orig_lines = [l.strip() for l in orig_str.splitlines() if l.strip()]
+        return all(
+            is_valid_korean_result(
+                orig_lines[idx] if idx < len(orig_lines) else orig_str,
+                re.sub(r"^(?:[-―—•·]+\s*)+", "", rl).strip(),
+                dict_map,
+            )
+            for idx, rl in enumerate(res_lines)
+        )
+
     if _has_non_korean_unicode_script(res_str):
         return False
-    if RE_CJK_PUNCT.search(res_str) or '""' in res_str or "''" in res_str or "\n" in res_str:
+    if RE_CJK_PUNCT.search(res_str) or '""' in res_str or "''" in res_str:
         return False
     if RE_MIXED_GIBBERISH.search(res_str):
         return False
     if is_ai_meta_response(original, res_str):
         return False
-
-    orig_str = str(original or "").strip()
     if RE_URL.match(orig_str):
         return True
     if dict_map and orig_str in dict_map and res_str == dict_map[orig_str]:
