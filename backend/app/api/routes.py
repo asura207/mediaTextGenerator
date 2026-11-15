@@ -717,6 +717,15 @@ async def sync_completed_tasks_from_disk_endpoint():
     return await run_in_threadpool(db.sync_disk_srt_to_completed_tasks)
 
 
+@router.post("/completed-tasks/deduplicate")
+async def deduplicate_completed_tasks_endpoint():
+    """
+    Removes older duplicate completed task entries for the same video/filename,
+    preserving only the most recent completion per video.
+    """
+    return await run_in_threadpool(db.deduplicate_completed_tasks)
+
+
 def _restore_task_status_sync(task_id: str) -> Optional[TaskStatus]:
     """Synchronously restores a TaskStatus from DB (transm_tasks / completed_tasks) or disk state."""
     try:

@@ -20,10 +20,11 @@ async def lifespan(app: FastAPI):
         init_db()
 
         import threading
-        # Background sync of existing SRT files from media scan directories into completed_tasks
+        # Background deduplication & sync of existing SRT files from media scan directories into completed_tasks
         def _bg_sync_disk():
             try:
-                from app.database import sync_disk_srt_to_completed_tasks
+                from app.database import deduplicate_completed_tasks, sync_disk_srt_to_completed_tasks
+                deduplicate_completed_tasks()
                 sync_disk_srt_to_completed_tasks()
             except Exception as sync_err:
                 logging.warning(f"Background disk SRT sync failed: {sync_err}")

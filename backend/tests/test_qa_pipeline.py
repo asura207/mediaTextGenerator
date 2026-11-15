@@ -692,6 +692,76 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "completed_tasks + transm_tasks JOIN 기반 video_folder 자동 분류 및 Selectbox 그룹핑 데이터 검증 통과",
         })
 
+    def test_10_deduplicate_completed_tasks_keeps_latest_only(self):
+        """
+        [Case 10] 작업완료건 중복 영상 과거 기록 삭제(최신건 유지) 검증:
+        동일 영상에 대해 과거 완료건과 최신 완료건이 공존할 때 deduplicate_completed_tasks()와
+        add_completed_task()가 과거 항목만 삭제하고 최신 1건만 남기며, sync_disk가 재삽입하지 않는지 검증.
+        """
+        from sqlalchemy import text
+
+        orig_engine = db_module._engine
+        orig_is_sqlite = db_module._is_sqlite
+        orig_db_name = db_module._connected_db_name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            temp_db_path = tmp_path / "qa_test_dedup.sqlite3"
+            try:
+                test_engine = create_engine(
+                    f"sqlite:///{temp_db_path.as_posix()}",
+                    connect_args={"check_same_thread": False, "timeout": 30.0},
+                )
+                db_module._configure_sqlite_pragma(test_engine)
+                db_module._engine = test_engine
+                db_module._is_sqlite = True
+                db_module._connected_db_name = str(temp_db_path)
+                init_db()
+
+                with test_engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO completed_tasks (task_id, filename, subtitle_count, srt_path, srt_download_url, task_type, completed_at)
+                        VALUES
+                          ('old_dup_1', 'XVSR-234.mp4', 100, 'D:\\disk\\XVSR-234.srt', '/api/download/old_dup_1', 'studio', '2026-11-13 10:00:00'),
+                          ('new_keep_1', 'XVSR-234.mp4', 120, 'D:\\processed\\new_keep_1.srt', '/api/download/new_keep_1', 'studio', '2026-11-15 11:00:00'),
+                          ('other_keep', 'MovieA.mp4', 80, 'D:\\processed\\other_keep.srt', '/api/download/other_keep', 'studio', '2026-11-14 09:00:00');
+                    """))
+                    conn.execute(text("""
+                        INSERT INTO transm_tasks (task_id, filename, status, stage, progress, video_path)
+                        VALUES
+                          ('old_dup_1', 'XVSR-234.mp4', 'COMPLETED', '완료', 100, 'D:\\disk\\XVSR-234.mp4'),
+                          ('new_keep_1', 'XVSR-234.mp4', 'COMPLETED', '완료', 100, 'D:\\disk\\XVSR-234.mp4'),
+                          ('other_keep', 'MovieA.mp4', 'COMPLETED', '완료', 100, 'D:\\disk\\MovieA.mp4');
+                    """))
+
+                res = db_module.deduplicate_completed_tasks()
+                self.assertEqual(res["removed_count"], 1)
+                self.assertEqual(res["removed_task_ids"], ["old_dup_1"])
+                self.assertEqual(res["remaining_count"], 2)
+
+                remaining_ids = [r["task_id"] for r in db_module.get_completed_tasks(limit=100)]
+                self.assertEqual(set(remaining_ids), {"new_keep_1", "other_keep"})
+
+                # add_completed_task 호출 시 기존 MovieA.mp4 과거건 자동 대체 검증
+                db_module.upsert_task("newer_movie_a", "MovieA.mp4", "COMPLETED", "완료", 100, video_path=r"D:\disk\MovieA.mp4")
+                db_module.add_completed_task("newer_movie_a", "MovieA.mp4", 95, r"D:\processed\newer_movie_a.srt", "/api/download/newer_movie_a", "studio")
+                final_ids = [r["task_id"] for r in db_module.get_completed_tasks(limit=100)]
+                self.assertEqual(set(final_ids), {"new_keep_1", "newer_movie_a"})
+
+                test_engine.dispose()
+            finally:
+                db_module._engine = orig_engine
+                db_module._is_sqlite = orig_is_sqlite
+                db_module._connected_db_name = orig_db_name
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "10. 작업완료건 중복 영상 과거 기록 삭제 검증",
+            "status": "PASS",
+            "input": "XVSR-234.mp4(2026-11-13 vs 2026-11-15), MovieA.mp4(기존건 + 신규 재작업)",
+            "output": f"일괄정리 삭제={res['removed_task_ids']} / 최종유지={sorted(final_ids)}",
+            "detail": "중복 영상 과거건 일괄 삭제 및 신규 완료 시 기존 과거건 자동 대체 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)

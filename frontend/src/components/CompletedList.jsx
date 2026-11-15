@@ -28,6 +28,7 @@ import {
 import {
   getCompletedTasks,
   syncCompletedTasksFromDisk,
+  deduplicateCompletedTasks,
   downloadSrtFile,
   getTaskStatus,
   deleteTask,
@@ -59,6 +60,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const [isBatchDownloadingUndownloaded, setIsBatchDownloadingUndownloaded] = useState(false);
   const [isBatchDownloadingSelected, setIsBatchDownloadingSelected] = useState(false);
   const [isSyncingDisk, setIsSyncingDisk] = useState(false);
+  const [isDeduplicating, setIsDeduplicating] = useState(false);
   const playerRef = useRef(null);
   const queryClient = useQueryClient();
 
@@ -512,6 +514,26 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
     }
   };
 
+  const handleDeduplicate = async () => {
+    try {
+      setIsDeduplicating(true);
+      const res = await deduplicateCompletedTasks();
+      await refetch();
+      const removed = res?.removed_count || 0;
+      const remaining = res?.remaining_count ?? allTasks.length;
+      if (removed > 0) {
+        alert(`중복 영상 과거 기록 ${removed}건을 정리했습니다.\n(최신 완료건 ${remaining}건 유지)`);
+      } else {
+        alert('현재 보관함에 중복된 영상 작업완료건이 없습니다.');
+      }
+    } catch (err) {
+      console.error('Deduplicate error:', err);
+      alert('중복 정리 중 오류가 발생했습니다: ' + (err.response?.data?.detail || err.message));
+    } finally {
+      setIsDeduplicating(false);
+    }
+  };
+
   const renderDeleteModal = () => {
     if (!deleteModalState.isOpen) return null;
     const { scope, task } = deleteModalState;
@@ -829,6 +851,16 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
               )}
             </button>
           )}
+
+          <button
+            onClick={handleDeduplicate}
+            disabled={isDeduplicating || isFetching}
+            className="flex items-center space-x-1.5 px-3 py-2 text-xs font-medium text-amber-300 hover:text-white bg-amber-950/40 hover:bg-amber-900/60 border border-amber-700/50 rounded-xl transition-all shadow-sm disabled:opacity-50"
+            title="중복된 영상의 과거 완료 기록을 정리하고 최신 완료건만 남깁니다"
+          >
+            <Trash2 className={`w-3.5 h-3.5 ${isDeduplicating ? 'animate-pulse text-amber-400' : 'text-amber-400'}`} />
+            <span>{isDeduplicating ? '중복 정리 중...' : '중복 정리'}</span>
+          </button>
 
           <button
             onClick={handleSyncDisk}

@@ -483,6 +483,82 @@ def get_all_tasks(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def _completed_dedup_keys(
+    task_type: Optional[str],
+    filename: Optional[str],
+    video_path: Optional[str] = None,
+) -> List[tuple[str, str, str]]:
+    """
+    Returns canonical deduplication keys for a completed task:
+    - (task_type, 'vp', normalized real disk video_path) when outside data/uploads
+    - (task_type, 'fn', normalized filename)
+    """
+    fn_raw = str(filename or "").strip()
+    tt = (
+        str(task_type).strip().lower()
+        if task_type
+        else ("translator" if fn_raw.lower().endswith(".srt") else "studio")
+    )
+    keys: List[tuple[str, str, str]] = []
+    norm_fn = fn_raw.replace("\\", "/").lstrip("/").lower()
+    if norm_fn:
+        keys.append((tt, "fn", norm_fn))
+
+    vp_raw = str(video_path or "").strip()
+    if vp_raw:
+        norm_vp = vp_raw.replace("\\", "/").lower()
+        if "/data/uploads/" not in norm_vp and not norm_vp.endswith("/data/uploads"):
+            keys.append((tt, "vp", norm_vp))
+    return keys
+
+
+def deduplicate_completed_tasks() -> Dict[str, Any]:
+    """
+    Finds duplicate completed videos (matching normalized filename or real disk video_path
+    within the same task_type), keeps the newest record (by completed_at DESC),
+    and removes older duplicate records from completed_tasks and transm_tasks.
+    """
+    engine = get_engine()
+    rows = []
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT c.task_id, c.filename, c.task_type, c.completed_at, t.video_path
+            FROM completed_tasks c
+            LEFT JOIN transm_tasks t ON c.task_id = t.task_id
+            ORDER BY c.completed_at DESC, c.task_id DESC;
+        """)).mappings().all()
+
+    seen_keys: set[tuple[str, str, str]] = set()
+    duplicate_ids: List[str] = []
+    kept_count = 0
+
+    for r in rows:
+        tid = str(r["task_id"])
+        keys = _completed_dedup_keys(r.get("task_type"), r.get("filename"), r.get("video_path"))
+        if keys and any(k in seen_keys for k in keys):
+            duplicate_ids.append(tid)
+        else:
+            seen_keys.update(keys)
+            kept_count += 1
+
+    if duplicate_ids:
+        chunk_size = 200
+        with engine.begin() as conn:
+            for i in range(0, len(duplicate_ids), chunk_size):
+                chunk = duplicate_ids[i : i + chunk_size]
+                placeholders = ", ".join(f":id_{idx}" for idx in range(len(chunk)))
+                params = {f"id_{idx}": tid for idx, tid in enumerate(chunk)}
+                conn.execute(text(f"DELETE FROM completed_tasks WHERE task_id IN ({placeholders});"), params)
+                conn.execute(text(f"DELETE FROM transm_tasks WHERE task_id IN ({placeholders});"), params)
+        logger.info(f"Deduplicated completed_tasks: removed {len(duplicate_ids)} older duplicate records, kept {kept_count}.")
+
+    return {
+        "removed_count": len(duplicate_ids),
+        "removed_task_ids": duplicate_ids,
+        "remaining_count": kept_count,
+    }
+
+
 def add_completed_task(
     task_id: str,
     filename: str,
@@ -491,7 +567,7 @@ def add_completed_task(
     srt_download_url: Optional[str] = None,
     task_type: str = "studio"
 ):
-    """Records or updates a completed subtitle generation task in database."""
+    """Records or updates a completed subtitle generation task in database, removing older duplicate video entries."""
     engine = get_engine()
     sql = """
     INSERT INTO completed_tasks (
@@ -516,6 +592,31 @@ def add_completed_task(
             "srt_download_url": srt_download_url or f"/api/download/{task_id}",
             "task_type": task_type
         })
+
+        # Remove older duplicate completed entries for the exact same video/filename
+        cur_vp = conn.execute(
+            text("SELECT video_path FROM transm_tasks WHERE task_id = :tid;"),
+            {"tid": task_id}
+        ).scalar()
+        target_keys = set(_completed_dedup_keys(task_type, filename, cur_vp))
+        if target_keys:
+            candidates = conn.execute(text("""
+                SELECT c.task_id, c.filename, c.task_type, t.video_path
+                FROM completed_tasks c
+                LEFT JOIN transm_tasks t ON c.task_id = t.task_id
+                WHERE c.task_id != :tid;
+            """), {"tid": task_id}).mappings().all()
+            older_dup_ids = [
+                str(c["task_id"])
+                for c in candidates
+                if any(k in target_keys for k in _completed_dedup_keys(c.get("task_type"), c.get("filename"), c.get("video_path")))
+            ]
+            if older_dup_ids:
+                placeholders = ", ".join(f":dup_{i}" for i in range(len(older_dup_ids)))
+                dup_params = {f"dup_{i}": did for i, did in enumerate(older_dup_ids)}
+                conn.execute(text(f"DELETE FROM completed_tasks WHERE task_id IN ({placeholders});"), dup_params)
+                conn.execute(text(f"DELETE FROM transm_tasks WHERE task_id IN ({placeholders});"), dup_params)
+                logger.info(f"Replaced {len(older_dup_ids)} older duplicate completed record(s) for '{filename}' with newest task {task_id}.")
 
 
 def increment_download_count(task_id: str) -> int:
@@ -1078,9 +1179,18 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
 
     synced_count = 0
     with engine.begin() as conn:
-        existing_res = conn.execute(text("SELECT task_id, srt_path FROM completed_tasks")).fetchall()
-        existing_paths = {str(Path(r[1]).resolve()) for r in existing_res if r[1]}
-        existing_ids = {str(r[0]) for r in existing_res if r[0]}
+        existing_res = conn.execute(text("""
+            SELECT c.task_id, c.srt_path, c.filename, c.task_type, t.video_path
+            FROM completed_tasks c
+            LEFT JOIN transm_tasks t ON c.task_id = t.task_id
+        """)).mappings().all()
+        existing_paths = {str(Path(r["srt_path"]).resolve()) for r in existing_res if r.get("srt_path")}
+        existing_ids = {str(r["task_id"]) for r in existing_res if r.get("task_id")}
+        existing_video_keys: set[tuple[str, str, str]] = set()
+        for r in existing_res:
+            existing_video_keys.update(
+                _completed_dedup_keys(r.get("task_type"), r.get("filename"), r.get("video_path"))
+            )
 
         for srt_p in discovered:
             try:
@@ -1119,6 +1229,9 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
                     break
 
             filename = srt_p.with_suffix(Path(video_p).suffix).name if video_p else srt_p.name
+            candidate_keys = _completed_dedup_keys("studio", filename, video_p)
+            if candidate_keys and any(k in existing_video_keys for k in candidate_keys):
+                continue
 
             conn.execute(text("""
                 INSERT INTO completed_tasks (
@@ -1158,6 +1271,7 @@ def sync_disk_srt_to_completed_tasks() -> Dict[str, Any]:
 
             existing_paths.add(resolved_str)
             existing_ids.add(tid)
+            existing_video_keys.update(candidate_keys)
             synced_count += 1
 
     logger.info(f"Synced {synced_count} existing SRT files from disk into completed_tasks.")

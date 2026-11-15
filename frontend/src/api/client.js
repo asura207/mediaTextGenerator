@@ -56,6 +56,11 @@ export const syncCompletedTasksFromDisk = async () => {
   return response.data;
 };
 
+export const deduplicateCompletedTasks = async () => {
+  const response = await api.post('/completed-tasks/deduplicate');
+  return response.data;
+};
+
 export const updateSubtitles = async (taskId, subtitles) => {
   const response = await api.put(`/tasks/${taskId}/subtitles`, { subtitles });
   return response.data;
