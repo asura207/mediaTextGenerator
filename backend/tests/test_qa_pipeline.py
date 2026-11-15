@@ -431,6 +431,74 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "1건 이상 선택 시 ZIP 생성·UTF-8 BOM 유지·미선택 항목 제외·0건 요청 400 방어 통과",
         })
 
+    def test_7_anti_chinese_leak_and_kana_recovery(self):
+        """
+        [Case 7] 중국어 누출 방어 · 전각 기호 보존 · 다중 턴 자가 교정 재시도 · 가나 음차 폴백 검증:
+        배치 LLM이 일본어 원문에서 중국어('喂，这个吗？...')를 잘못 출력하더라도
+        자가 교정 다중 턴 피드백으로 순수 한국어로 복구되고, 전각 기호(、？)가 포함된 한국어 문장이
+        '...'로 소실되지 않으며, 순수 가나 인명('ユメちゃん')도 한글 음차('유메짱')로 보존되는지 검증.
+        """
+        import json
+        from unittest.mock import patch
+        from app.services.llm_refiner import (
+            refine_subtitles_batch,
+            sanitize_subtitle_text,
+            transliterate_kana_to_hangul,
+            is_valid_korean_result,
+        )
+
+        # 1. CJK fullwidth punctuation in valid Korean translation must NOT truncate or wipe to '...'
+        orig_jp = "なぁ、これのこと?え、え、あれ?夢ちゃんと遥香さんは?"
+        ko_with_cjk_punct = "이봐、이거 말이야？ 유메랑 하루카 씨는？"
+        cleaned_ko = sanitize_subtitle_text(orig_jp, ko_with_cjk_punct)
+        self.assertEqual(cleaned_ko, "이봐, 이거 말이야? 유메랑 하루카 씨는?")
+        self.assertTrue(is_valid_korean_result(orig_jp, cleaned_ko))
+
+        # 2. Pure-Kana name transliteration fallback
+        self.assertEqual(transliterate_kana_to_hangul("ユメちゃん"), "유메짱")
+        self.assertEqual(transliterate_kana_to_hangul("ゆめちゃん"), "유메짱")
+
+        # 3. Simulated Qwen Chinese leak in batch -> multi-turn corrective retry succeeds
+        batch = [
+            {"index": 4, "raw_text": "俺じゃあ、ただの変態じゃん、俺。"},
+            {"index": 6, "raw_text": orig_jp},
+        ]
+        captured_calls = []
+
+        def fake_chat_completion(messages, **kwargs):
+            captured_calls.append(messages)
+            # First call = batch call returning Chinese leaked text
+            if len(captured_calls) == 1:
+                return json.dumps({
+                    "subtitles": [
+                        {"id": 4, "text": "我就是个变态罢了。"},
+                        {"id": 6, "text": "喂，这个吗？嗯、嗯，那梦ちゃんと遥香さんは呢？"},
+                    ]
+                }, ensure_ascii=False)
+            # Subsequent single-segment calls must contain the prior rejected Chinese output as assistant turn
+            assistant_msgs = [m["content"] for m in messages if m["role"] == "assistant"]
+            self.assertTrue(len(assistant_msgs) >= 1, "다중 턴 자가 교정 피드백이 누락되었습니다.")
+            user_joined = " ".join(m["content"] for m in messages if m["role"] == "user")
+            if '"id": 4' in user_joined:
+                return json.dumps({"text": "이러면 나 그냥 변태잖아."}, ensure_ascii=False)
+            return json.dumps({"text": "이봐, 이거 말이야? 유메랑 하루카 씨는?"}, ensure_ascii=False)
+
+        with patch("app.services.llm_refiner.chat_completion", side_effect=fake_chat_completion):
+            res = refine_subtitles_batch(None, batch, dict_map={}, source_lang_hint="일본어")
+
+        self.assertEqual(res[4], "이러면 나 그냥 변태잖아.")
+        self.assertEqual(res[6], "이봐, 이거 말이야? 유메랑 하루카 씨는?")
+        self.assertTrue(is_valid_korean_result(batch[0]["raw_text"], res[4]))
+        self.assertTrue(is_valid_korean_result(batch[1]["raw_text"], res[6]))
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "7. 중국어 누출 방어 · 다중 턴 자가 교정 · 가나 음차",
+            "status": "PASS",
+            "input": "배치 오출력('我就是个变态罢了。', '喂，这个吗？...'), 'ユメちゃん', '이봐、이거 말이야？'",
+            "output": f"#4='{res[4]}' | #6='{res[6]}' | 'ユメちゃん'->'{transliterate_kana_to_hangul('ユメちゃん')}'",
+            "detail": "중국어 누출 시 다중 턴 자가 교정 피드백으로 100% 한글 복구 & 전각 기호 정규화 & 가나 음차 폴백 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)

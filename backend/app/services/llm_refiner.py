@@ -266,6 +266,107 @@ KANA_TO_HANGUL = {
     'ッ': '',
 }
 
+_CJK_PUNCT_TRANS = str.maketrans({
+    "。": ". ",
+    "，": ", ",
+    "、": ", ",
+    "：": ": ",
+    "；": "; ",
+    "？": "?",
+    "！": "!",
+    "〜": "~",
+    "～": "~",
+    "（": "(",
+    "）": ")",
+    "「": '"',
+    "」": '"',
+    "『": '"',
+    "』": '"',
+    "“": '"',
+    "”": '"',
+    "‘": "'",
+    "’": "'",
+    "【": "[",
+    "】": "]",
+    "《": "<",
+    "》": ">",
+    "〈": "<",
+    "〉": ">",
+    "・": "·",
+})
+
+_KANA_DIGRAPH_TO_HANGUL = {
+    "ちゃん": "짱", "チャン": "짱",
+    "くん": "군", "クン": "군",
+    "さん": "상", "サン": "상",
+    "きゃ": "캬", "きゅ": "큐", "きょ": "쿄",
+    "しゃ": "샤", "しゅ": "슈", "しょ": "쇼",
+    "ちゃ": "차", "ちゅ": "추", "ちょ": "초",
+    "にゃ": "냐", "にゅ": "뉴", "にょ": "뇨",
+    "ひゃ": "햐", "ひゅ": "휴", "ひょ": "효",
+    "みゃ": "먀", "みゅ": "뮤", "みょ": "묘",
+    "りゃ": "랴", "りゅ": "류", "りょ": "료",
+    "ぎゃ": "갸", "ぎゅ": "규", "ぎょ": "교",
+    "じゃ": "자", "じゅ": "주", "じょ": "조",
+    "びゃ": "뱌", "びゅ": "뷰", "びょ": "뵤",
+    "ぴゃ": "퍄", "ぴゅ": "퓨", "ぴょ": "표",
+    "キャ": "캬", "キュ": "큐", "キョ": "쿄",
+    "シャ": "샤", "シュ": "슈", "ショ": "쇼",
+    "チャ": "차", "チュ": "추", "チョ": "초",
+    "ニャ": "냐", "ニュ": "뉴", "ニョ": "뇨",
+    "ヒャ": "햐", "ヒュ": "휴", "ヒョ": "효",
+    "ミャ": "먀", "ミュ": "뮤", "ミョ": "묘",
+    "リャ": "랴", "リュ": "류", "リョ": "료",
+    "ギャ": "갸", "ギュ": "규", "ギョ": "교",
+    "ジャ": "자", "ジュ": "주", "ジョ": "조",
+    "ビャ": "뱌", "ビュ": "뷰", "ビョ": "뵤",
+    "ピャ": "퍄", "ピュ": "퓨", "ピョ": "표",
+    "ティ": "티", "ディ": "디", "ファ": "파", "フィ": "피", "フェ": "페", "フォ": "포",
+}
+
+
+def normalize_cjk_punctuation(text: str) -> str:
+    """Converts CJK fullwidth punctuation to standard ASCII/Korean punctuation without destroying text."""
+    if not text:
+        return ""
+    s = str(text).translate(_CJK_PUNCT_TRANS)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def transliterate_kana_to_hangul(text: str) -> Optional[str]:
+    """Transliterates pure-Kana Japanese phrases/names (e.g. 'ユメちゃん') into Hangul as last resort."""
+    s = normalize_cjk_punctuation(text)
+    if not s:
+        return None
+    # Only apply if no Kanji/Hanzi or Latin letters exist (strictly Kana + punctuation/spaces)
+    if RE_CHINESE.search(s) or RE_LATIN_CHAR.search(s):
+        return None
+    if not RE_JAPANESE.search(s):
+        return None
+    out: List[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        matched = False
+        for size in (3, 2):
+            if i + size <= n and s[i:i + size] in _KANA_DIGRAPH_TO_HANGUL:
+                out.append(_KANA_DIGRAPH_TO_HANGUL[s[i:i + size]])
+                i += size
+                matched = True
+                break
+        if matched:
+            continue
+        ch = s[i]
+        if ch in KANA_TO_HANGUL:
+            out.append(KANA_TO_HANGUL[ch])
+        elif not unicodedata.category(ch).startswith("L"):
+            out.append(ch)
+        else:
+            return None
+        i += 1
+    res = re.sub(r"\s+", " ", "".join(out)).strip()
+    return res if RE_KOREAN.search(res) else None
+
 AI_META_PATTERNS = re.compile(
     r'(번역\s*결과|번역할\s*수|번역해\s*드릴|번역해\s*드리|번역\s*작업을|번역이\s*필요|번역을\s*어떻게|번역하겠|번역하면|번역하자면|번역\s*불가능|'
     r'변환해\s*드릴|변환\s*가능한|바꾸면|바꿔볼까요|바꾼\s*거예요|바꿔\s*말할|표현하면|표현할\s*수|표현입니다|표현이에요|표현은|표현으로는|표현하자면|표현하려는|'
@@ -380,11 +481,11 @@ def is_clean_korean_line(line: str, raw_text: str = "") -> bool:
 
 
 def _sanitize_single_subtitle_line(raw_s: str, text: str) -> str:
-    """Cleans a single subtitle line by stripping CJK punctuation, empty quotes, and AI meta-notes."""
+    """Cleans a single subtitle line by normalizing CJK punctuation, stripping empty quotes, and removing AI meta-notes."""
     if not text or not str(text).strip():
         return fast_translate_short(raw_s)
 
-    s = str(text).strip()
+    s = normalize_cjk_punctuation(str(text).strip())
     has_bullet = bool(re.match(r"^(?:[-―—•·]+\s*)+", s)) or bool(re.match(r"^(?:[-―—•·]+\s*)+", raw_s))
     s_core = re.sub(r"^(?:[-―—•·]+\s*)+", "", s).strip()
     raw_core = re.sub(r"^(?:[-―—•·]+\s*)+", "", raw_s).strip()
@@ -604,17 +705,24 @@ Whisper 음성인식(STT) 모델이 추출한 자막 세그먼트 목록을 전�
    - 사전이나 책을 읽는 듯한 딱딱하고 어색한 문어체(~하는 것이다, ~에 있어서 등)는 절대 사용하지 마세요.
    - 실제 사람이 일상에서 자연스럽게 대화하듯 유려하고 생생한 구어체(대화체)로 번역 및 의역하세요.
    - 번역투 3인칭 대명사('그는', '그녀는', '그것은' 등)는 생략하거나 자연스러운 대화체로 바꾸세요.
-4. **모든 외국어(영어, 일본어, 중국어 등 언어 불문) 100% 순수 한글 번역 필수**:
-   - 원문이 영어, 일본어, 중국어, 프랑스어, 스페인어 등 어떤 언어로 추출되었든 외국어 문장이나 단어를 원문 그대로 남기지 말고 예외 없이 100% 자연스러운 한국어(한글)로 번역하세요.
-   - 영어 알파벳 문장을 그대로 복사하거나 일본어/한자를 남기면 절대 안 됩니다.
+4. **모든 외국어 100% 순수 한국어 한글(가-힣) 번역 필수 — 중국어(한자)·일본어 출력 절대 금지**:
+   - 원문이 일본어(한자/가나), 중국어(한자), 영어 등 어떤 언어로 추출되었든 출력에는 중국어(한자/간체자/번체자), 일본어(히라가나/가타카나), 영어 알파벳을 단 한 글자도 남기지 마세요.
+   - 특히 일본어 원문에 한자(예: 変態, 女子, 夢ちゃん, 遥香さん)가 포함되어 있어도 절대 중국어로 번역하거나 한자/가나를 그대로 두지 말고, 반드시 자연스러운 한국어 한글(예: 변태, 여자, 유메, 하루카 씨)로만 작성하세요.
 5. **감탄사, 비명, 신음, 숨소리 100% 보존 원칙 (절대 누락/삭제 금지)**:
    - 등장인물의 감탄사, 비명, 신음, 헐떡임, 놀람, 당황, 흐느낌 등 비언어적/정서적 발화(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...' 등)는 절대 생략하거나 삭제하지 말고 1:1로 온전히 살려두세요.
 6. **서식 태그 및 세그먼트 1:1 유지**:
    - 원문에 포함된 자막 서식 태그(<i>, </i>, <b>, </b> 등)는 그대로 보존하세요.
    - 전달받은 세그먼트의 번호(id)와 개수를 반드시 정확히 1:1로 유지해야 합니다. 임의로 합치거나 분리하거나 삭제하지 마세요.
 
+[올바른 한국어 JSON 출력 예시]
+{
+  "subtitles": [
+    {"id": 1, "text": "이봐, 이거 말이야? 응, 유메랑 하루카 씨는?"}
+  ]
+}
+
 [출력 형식]
-반드시 아래와 같은 JSON 객체 형식으로만 응답하세요. 다른 설명이나 인사말은 일체 포함하지 마세요:
+설명, 인사말, 중국어·일본어 원문 없이 반드시 아래와 같은 순수 한국어 JSON 객체 형식으로만 응답하세요:
 {
   "subtitles": [
     {"id": 1, "text": "자연스러운 구어체 한국어 자막 문장"}
@@ -803,14 +911,35 @@ def extract_subtitles_via_regex(raw_text: str) -> Dict[int, str]:
                 pass
     return results
 
+def _extract_single_json_text(content: str) -> str:
+    """Extracts the subtitle string from a single-segment LLM response (JSON or plain text)."""
+    try:
+        parsed = json.loads(clean_json_response(content))
+        if isinstance(parsed, dict):
+            return str(
+                parsed.get("text")
+                or parsed.get("korean")
+                or parsed.get("translation")
+                or parsed.get("refined_text")
+                or ""
+            ).strip()
+    except Exception:
+        pass
+    return str(content or "").strip()
+
+
 def refine_single_segment_fallback(
     client: Optional[ollama.Client],
     seg_id: int,
     raw_text: str,
     dict_map: Optional[Dict[str, str]] = None,
-    source_lang_hint: str = "외국어"
+    source_lang_hint: str = "외국어",
+    prior_bad_output: str = "",
 ) -> str:
-    """Ultra-reliable single-line translation/refinement fallback with Senior persona and dictionary lookup."""
+    """
+    Ultra-reliable single-line translation/refinement fallback with Senior persona,
+    dictionary lookup, and multi-turn anti-Chinese/foreign-script self-correction.
+    """
     if not raw_text or not str(raw_text).strip():
         return "..."
     raw_clean = str(raw_text).strip()
@@ -824,42 +953,55 @@ def refine_single_segment_fallback(
     dict_section = build_refiner_dict_section([{"text": raw_clean}], dict_map)
     system_prompt = (
         "당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 번역가입니다. "
-        f"원문 언어({source_lang_hint})로 된 입력 자막을 원문 그대로 남기지 말고 반드시 자연스러운 한국어(한글) 구어체 한 문장으로 번역 및 교정하여 "
-        '반드시 {"text": "번역된 한국어 자막"} 형식의 JSON으로만 응답하세요. '
-        "인명은 원문 발음대로 한글 음차 표기하고 고유명사 사전을 최우선 적용하세요. "
-        f"{dict_section}\n부연 설명, 원문 외국어(영어/일본어/중국어 등) 복사, 전각 기호를 절대 포함하지 마세요."
+        f"원문 언어({source_lang_hint})로 된 입력 자막을 반드시 100% 순수 한국어(한글) 구어체 한 문장으로 번역하세요. "
+        '반드시 {"text": "한국어 자막"} 형식의 JSON으로만 응답하세요. '
+        "중국어(한자/간체자/번체자), 일본어(히라가나/가타카나), 영어 알파벳을 출력에 단 한 글자도 남기지 마세요. "
+        "인명은 원문 발음대로 한글 음차 표기하고(예: 유메, 하루카) 고유명사 사전을 최우선 적용하세요. "
+        f"{dict_section}\n"
+        '예시: 입력 {"id": 1, "text": "夢ちゃんと遥香さんは?"} -> 출력 {"text": "유메랑 하루카 씨는?"}'
     )
     user_prompt = json.dumps({"id": seg_id, "text": raw_clean}, ensure_ascii=False)
 
-    for attempt in range(2):
+    last_bad = str(prior_bad_output or "").strip()
+    temperatures = (0.15, 0.25, 0.35)
+    for attempt in range(3):
         try:
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if last_bad:
+                messages.append(
+                    {"role": "assistant", "content": json.dumps({"text": last_bad}, ensure_ascii=False)}
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"오류: 직전 응답 '{last_bad[:80]}'에 중국어(한자)·일본어(가나)·외국어가 섞여 있거나 올바른 한국어가 아닙니다. "
+                        "한자와 가나를 절대 한 글자도 쓰지 말고, 오직 한국어 한글(가-힣)로만 다시 번역해 "
+                        '{"text": "순수 한글 번역"} JSON으로 응답하세요.'
+                    ),
+                })
+
             content = chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.15 if attempt == 0 else 0.3,
+                messages=messages,
+                temperature=temperatures[attempt],
                 format_json=True,
                 max_tokens=256,
-                timeout=45.0
+                timeout=45.0,
             )
-            candidate = ""
-            try:
-                parsed = json.loads(clean_json_response(content))
-                if isinstance(parsed, dict):
-                    candidate = str(parsed.get("text") or parsed.get("korean") or parsed.get("translation") or "").strip()
-            except Exception:
-                candidate = content.strip()
-
-            sanitized = sanitize_subtitle_text(raw_clean, candidate)
+            raw_candidate = _extract_single_json_text(content)
+            sanitized = sanitize_subtitle_text(raw_clean, raw_candidate)
             if dict_map:
                 sanitized = apply_dictionary_postprocess(raw_clean, sanitized, dict_map)
             if sanitized and is_valid_korean_result(raw_clean, sanitized, dict_map):
                 return sanitized
+            if raw_candidate:
+                last_bad = raw_candidate
         except Exception as e:
             logger.warning(f"Single segment refinement failed for #{seg_id} (attempt {attempt + 1}): {e}")
 
-    fb = fast_translate_short(raw_clean) or "..."
+    fb = fast_translate_short(raw_clean) or transliterate_kana_to_hangul(raw_clean) or "..."
     if fb and dict_map:
         fb = apply_dictionary_postprocess(raw_clean, fb, dict_map)
     return fb
@@ -879,13 +1021,15 @@ def refine_subtitles_batch(
     if source_lang_hint == "한국어":
         user_prompt = (
             "다음 자막 세그먼트들을 자연스럽고 유창한 한국어 구어체로 교정하고, "
-            f"외국어(영어/일본어/중국어 등)가 포함된 경우 예외 없이 한국어로 번역해 주세요:\n"
+            "외국어(영어/일본어/중국어 등)가 포함된 경우 예외 없이 순수 한국어(한글)로 번역해 주세요 "
+            "(출력에 한자·중국어·일본어 절대 금지):\n"
             f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
         )
     else:
         user_prompt = (
             f"원문 감지 언어: [{source_lang_hint}]\n"
-            "아래 자막 세그먼트들을 원문 그대로 남기지 말고, 예외 없이 100% 자연스럽고 유창한 한국어(한글) 구어체 자막으로 번역해 주세요:\n"
+            "아래 자막 세그먼트들을 원문 그대로 두거나 중국어(한자)·일본어로 출력하지 말고, "
+            "반드시 모든 항목을 100% 순수 한국어(한글) 구어체 자막 JSON으로 번역해 주세요:\n"
             f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
         )
 
@@ -917,19 +1061,25 @@ def refine_subtitles_batch(
                 logger.warning(f"Could not parse LLM JSON batch: {e}. Attempting regex fallback.")
                 result_map = extract_subtitles_via_regex(response_text)
 
-    # Validate & sanitize results: if invalid or untranslated/meta-response, retry individually
+    # Validate & sanitize results: if invalid or untranslated/meta-response, retry individually with corrective feedback
     for seg in batch_segments:
         sid = seg["index"]
         raw = seg.get("raw_text", "")
-        if sid in result_map and result_map[sid]:
-            trans = sanitize_subtitle_text(raw, result_map[sid])
+        raw_cand = result_map.get(sid, "")
+        if raw_cand:
+            trans = sanitize_subtitle_text(raw, raw_cand)
             if dict_map:
                 trans = apply_dictionary_postprocess(raw, trans, dict_map)
             if is_valid_korean_result(raw, trans, dict_map):
                 result_map[sid] = trans
             else:
-                logger.info(f"Segment #{sid} returned invalid/untranslated text '{result_map[sid]}'. Retrying individually.")
-                result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map, source_lang_hint)
+                logger.debug(f"Segment #{sid} batch output rejected ('{raw_cand}'). Retrying individually with Korean enforcement.")
+                recovered = refine_single_segment_fallback(
+                    client, sid, raw, dict_map, source_lang_hint, prior_bad_output=raw_cand
+                )
+                result_map[sid] = recovered
+                if not is_valid_korean_result(raw, recovered, dict_map):
+                    logger.warning(f"Segment #{sid} could not be fully translated to Korean ('{raw}') -> fallback '{recovered}'")
         else:
             result_map[sid] = refine_single_segment_fallback(client, sid, raw, dict_map, source_lang_hint)
 

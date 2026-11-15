@@ -19,10 +19,12 @@ from app.services.llm_refiner import (
     extract_translations_from_parsed,
     extract_subtitles_via_regex,
     fast_translate_short,
+    transliterate_kana_to_hangul,
     sanitize_subtitle_text,
     is_valid_korean_result,
     is_foreign_text as refiner_is_foreign_text,
     _match_proper_noun_in_text,
+    _extract_single_json_text,
     apply_dictionary_postprocess as refiner_apply_dictionary_postprocess,
 )
 
@@ -43,9 +45,10 @@ SENIOR_TRANSLATOR_PROMPT_TEMPLATE = """당신은 20년 차 이상의 경력을 �
 설명을 덧붙이거나, 대사를 생략하거나, 분리된 자막을 하나로 합치지 마세요.
 
 [추가 필수 준수 규칙]
-1. 이름 번역 금지: 캐릭터 이름이나 인명은 번역하거나 다른 단어로 의역하지 말고 원문 의미/발음 그대로 유지해 주세요(단, 고유명사 사전에 등록된 경우는 사전 표기를 따름).
+1. 이름 번역 금지: 캐릭터 이름이나 인명은 번역하거나 다른 단어로 의역하지 말고 원문 발음/음차 표기를 유지해 주세요(단, 고유명사 사전에 등록된 경우는 사전 표기를 따름).
 2. 고유명사 사전 최우선 적용: 함께 제공되는 [고유명사 사전]에 등록된 원문 단어가 대사에 등장할 경우, 반드시 사전에 지정된 '번역 단어'를 그대로 사용해 주세요.
 3. 감탄사, 비명, 신음, 숨소리 100% 보존: 등장인물의 감탄사, 비명, 신음, 호흡(예: '앗!', '아아...', '으윽!', '음...', '꺄악!', '하아...')은 삭제하지 말고 1:1로 온전히 살려두세요.
+4. 대상 언어 전용 출력(다른 언어 문자 혼입 금지): 대상 언어가 한국어({1})인 경우 중국어(한자/간체자/번체자)나 일본어(가나), 영어 알파벳을 출력에 절대 남기지 말고 오직 순수 한국어 한글로만 작성하세요.
 {dictionary_section}
 [출력 형식]
 반드시 아래 JSON 형식으로만 응답하세요:
@@ -118,9 +121,10 @@ def translate_single_segment_fallback(
     target_lang: str,
     target_lang_name: str,
     source_lang_name: str = "원문 언어",
-    dict_map: Optional[Dict[str, str]] = None
+    dict_map: Optional[Dict[str, str]] = None,
+    prior_bad_output: str = "",
 ) -> str:
-    """Single segment translation fallback with Senior Translator persona and dictionary lookup."""
+    """Single segment translation fallback with Senior Translator persona, dictionary lookup, and multi-turn self-correction."""
     if not original_text or not str(original_text).strip():
         return "..."
     orig_clean = str(original_text).strip()
@@ -134,47 +138,63 @@ def translate_single_segment_fallback(
     dict_map = dict_map or {}
     dict_section = build_dictionary_prompt_section([{"text": orig_clean}], dict_map)
 
+    extra_ko_rule = (
+        "중국어(한자/간체자/번체자)나 일본어(히라가나/가타카나)를 출력에 절대 남기지 말고 오직 순수 한국어 한글(가-힣)로만 작성하세요. "
+        if target_lang == "ko"
+        else ""
+    )
     system_prompt = (
         f"당신은 20년 차 이상의 경력을 가진 베테랑 외국어 전문 시니어 번역가입니다. "
         f"입력된 애니메이션 자막 한 줄을 {source_lang_name}에서 자연스러운 구어체 {target_lang_name}로 번역하여 "
         '반드시 {"text": "번역된 자막"} 형식의 JSON으로만 응답하세요. '
-        "이름은 임의로 번역하지 말고 원문 발음/표기를 유지하세요. "
+        f"{extra_ko_rule}"
+        "이름은 임의로 번역하지 말고 대상 언어 발음 표기를 유지하세요. "
         f"{dict_section}\n"
         "절대로 설명이나 부연 해설을 덧붙이지 마세요."
     )
     user_prompt = json.dumps({"id": seg_id, "text": orig_clean}, ensure_ascii=False)
 
-    for attempt in range(2):
+    last_bad = str(prior_bad_output or "").strip()
+    temperatures = (0.15, 0.25, 0.35)
+    for attempt in range(3):
         try:
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if last_bad:
+                messages.append(
+                    {"role": "assistant", "content": json.dumps({"text": last_bad}, ensure_ascii=False)}
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"오류: 직전 응답 '{last_bad[:80]}'이(가) {target_lang_name} 번역 기준에 맞지 않거나 원문/외국어가 남아 있습니다. "
+                        f"반드시 100% {target_lang_name}로만 다시 번역해 "
+                        '{"text": "번역된 자막"} JSON으로 응답하세요.'
+                    ),
+                })
+
             content = chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.15 if attempt == 0 else 0.3,
+                messages=messages,
+                temperature=temperatures[attempt],
                 format_json=True,
                 max_tokens=256,
-                timeout=45.0
+                timeout=45.0,
             )
-            candidate = ""
-            try:
-                parsed = json.loads(clean_json_response(content))
-                if isinstance(parsed, dict):
-                    candidate = str(parsed.get("text") or parsed.get("korean") or parsed.get("translation") or "").strip()
-            except Exception:
-                candidate = content.strip()
-
-            if target_lang == "ko":
-                candidate = sanitize_subtitle_text(orig_clean, candidate)
+            raw_candidate = _extract_single_json_text(content)
+            candidate = sanitize_subtitle_text(orig_clean, raw_candidate) if target_lang == "ko" else raw_candidate
             if dict_map:
                 candidate = apply_dictionary_postprocess(orig_clean, candidate, dict_map)
 
             if candidate and is_valid_translation_result(orig_clean, candidate, target_lang, dict_map):
                 return candidate
+            if raw_candidate:
+                last_bad = raw_candidate
         except Exception as e:
             logger.warning(f"Single segment translation fallback failed for #{seg_id} (attempt {attempt + 1}): {e}")
 
-    fb = fast_translate_short(orig_clean) if target_lang == "ko" else ""
+    fb = (fast_translate_short(orig_clean) or transliterate_kana_to_hangul(orig_clean)) if target_lang == "ko" else ""
     if fb and dict_map:
         fb = apply_dictionary_postprocess(orig_clean, fb, dict_map)
     return fb or "..."
@@ -233,8 +253,9 @@ def translate_batch(
     for seg in batch_segments:
         sid = seg.get("index") or seg.get("id")
         orig = seg.get("refined_text") or seg.get("text") or seg.get("raw_text") or ""
-        if sid in result_map and result_map[sid]:
-            candidate = result_map[sid]
+        raw_cand = result_map.get(sid, "")
+        if raw_cand:
+            candidate = raw_cand
             if target_lang == "ko":
                 candidate = sanitize_subtitle_text(orig, candidate)
             # Apply Proper Noun Dictionary replacement
@@ -242,8 +263,13 @@ def translate_batch(
             if is_valid_translation_result(orig, candidate, target_lang, dict_map):
                 result_map[sid] = candidate
             else:
-                logger.info(f"Segment #{sid} invalid translation '{candidate}'. Retrying individually.")
-                result_map[sid] = translate_single_segment_fallback(sid, orig, target_lang, target_lang_name, source_lang_name, dict_map)
+                logger.debug(f"Segment #{sid} translation batch output rejected ('{raw_cand}'). Retrying individually.")
+                recovered = translate_single_segment_fallback(
+                    sid, orig, target_lang, target_lang_name, source_lang_name, dict_map, prior_bad_output=raw_cand
+                )
+                result_map[sid] = recovered
+                if not is_valid_translation_result(orig, recovered, target_lang, dict_map):
+                    logger.warning(f"Segment #{sid} could not be cleanly translated to {target_lang_name} ('{orig}') -> '{recovered}'")
         else:
             result_map[sid] = translate_single_segment_fallback(sid, orig, target_lang, target_lang_name, source_lang_name, dict_map)
 
