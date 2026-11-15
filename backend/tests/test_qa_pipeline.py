@@ -357,6 +357,80 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "등록·수정·50건 페이징·단어경계 치환·받침 조사 보정(은->는, 을->를)·삭제 완벽 통과",
         })
 
+    def test_6_batch_download_selected_zip(self):
+        """
+        [Case 6] 선택 항목(1건 이상) ZIP 일괄 다운로드 검증:
+        체크된 task_ids가 1건일 때와 다건(2건)일 때 모두 /api/download/batch-selected가
+        UTF-8 BOM(.srt)을 포함한 정상 ZIP 압축 파일만 반환하고, 선택되지 않은 항목은 제외되는지 검증.
+        """
+        import asyncio
+        import io
+        import zipfile
+        from fastapi import HTTPException
+        from app.api.routes import batch_download_selected, BatchDownloadRequest
+
+        orig_engine = db_module._engine
+        orig_is_sqlite = db_module._is_sqlite
+        orig_db_name = db_module._connected_db_name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            temp_db_path = tmp_path / "qa_test_zip.sqlite3"
+            try:
+                test_engine = create_engine(
+                    f"sqlite:///{temp_db_path.as_posix()}",
+                    connect_args={"check_same_thread": False, "timeout": 30.0},
+                )
+                db_module._configure_sqlite_pragma(test_engine)
+                db_module._engine = test_engine
+                db_module._is_sqlite = True
+                db_module._connected_db_name = str(temp_db_path)
+                init_db()
+
+                srt1 = tmp_path / "t_sel_1.srt"
+                srt2 = tmp_path / "t_sel_2.srt"
+                srt3 = tmp_path / "t_unselected.srt"
+                generate_srt_file([{"index": 1, "start": 1.0, "end": 2.0, "text": "첫 번째 선택 자막"}], srt1)
+                generate_srt_file([{"index": 1, "start": 1.0, "end": 2.0, "text": "두 번째 선택 자막"}], srt2)
+                generate_srt_file([{"index": 1, "start": 1.0, "end": 2.0, "text": "미선택 자막"}], srt3)
+
+                db_module.add_completed_task("task_sel_1", "movie_one.mp4", 1, str(srt1), "/api/download/task_sel_1", "studio")
+                db_module.add_completed_task("task_sel_2", "movie_two.mp4", 1, str(srt2), "/api/download/task_sel_2", "studio")
+                db_module.add_completed_task("task_unsel", "movie_three.mp4", 1, str(srt3), "/api/download/task_unsel", "studio")
+
+                # 0건 요청 시 400 방어
+                with self.assertRaises(HTTPException) as ctx:
+                    asyncio.run(batch_download_selected(BatchDownloadRequest(task_ids=[])))
+                self.assertEqual(ctx.exception.status_code, 400)
+
+                # 1건 선택 시에도 ZIP 반환 검증
+                resp_one = asyncio.run(batch_download_selected(BatchDownloadRequest(task_ids=["task_sel_1"])))
+                self.assertEqual(resp_one.media_type, "application/zip")
+                with zipfile.ZipFile(io.BytesIO(resp_one.body), "r") as zf1:
+                    self.assertEqual(zf1.namelist(), ["movie_one.srt"])
+                    self.assertTrue(zf1.read("movie_one.srt").startswith(b"\xef\xbb\xbf"))
+
+                # 2건 선택 시 정확히 선택된 2건만 ZIP 반환 검증
+                resp_two = asyncio.run(batch_download_selected(BatchDownloadRequest(task_ids=["task_sel_1", "task_sel_2"])))
+                self.assertEqual(resp_two.media_type, "application/zip")
+                with zipfile.ZipFile(io.BytesIO(resp_two.body), "r") as zf2:
+                    self.assertEqual(sorted(zf2.namelist()), ["movie_one.srt", "movie_two.srt"])
+                    self.assertNotIn("movie_three.srt", zf2.namelist())
+
+                test_engine.dispose()
+            finally:
+                db_module._engine = orig_engine
+                db_module._is_sqlite = orig_is_sqlite
+                db_module._connected_db_name = orig_db_name
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "6. 선택 항목(>=1건) ZIP 다운로드 API 검증",
+            "status": "PASS",
+            "input": "1건(['task_sel_1']) 및 2건(['task_sel_1', 'task_sel_2']) 선택 요청",
+            "output": "1건 -> ['movie_one.srt'](ZIP, BOM), 2건 -> ['movie_one.srt', 'movie_two.srt'](미선택 제외)",
+            "detail": "1건 이상 선택 시 ZIP 생성·UTF-8 BOM 유지·미선택 항목 제외·0건 요청 400 방어 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)

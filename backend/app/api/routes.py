@@ -990,7 +990,11 @@ def _build_zip_archive_sync(eligible_tasks: List[Dict[str, Any]]) -> tuple[bytes
                 try:
                     _, segments = load_segments_from_task(t_id)
                     if segments:
-                        optimized = optimize_subtitle_timing(segments)
+                        optimized = optimize_subtitle_timing(
+                            segments,
+                            extend_sec=0.0,
+                            apply_timing_optimization=False,
+                        )
                         out = io.StringIO()
                         for idx, seg in enumerate(optimized, start=1):
                             s_start = seg.get("start_str") or "00:00:00,000"
@@ -1015,10 +1019,14 @@ def _build_zip_archive_sync(eligible_tasks: List[Dict[str, Any]]) -> tuple[bytes
 
 async def _execute_batch_download(
     req: Optional[BatchDownloadRequest],
-    undownloaded_only: bool
+    undownloaded_only: bool,
+    selected_only: bool = False,
 ):
-    target_ids = req.task_ids if req and req.task_ids else None
+    target_ids = req.task_ids if req and req.task_ids is not None else None
     task_type_filter = req.task_type if req and req.task_type else None
+
+    if selected_only and not target_ids:
+        raise HTTPException(status_code=400, detail="다운로드할 항목을 1건 이상 선택해 주세요.")
 
     # Retrieve completed tasks (filter out 0-subtitle tasks from batch downloads)
     all_completed = await run_in_threadpool(db.get_completed_tasks, limit=50000, task_type=task_type_filter)
@@ -1037,7 +1045,9 @@ async def _execute_batch_download(
         eligible_tasks = [t for t in eligible_tasks if t["task_id"] in target_id_set]
 
     if not eligible_tasks:
-        if undownloaded_only:
+        if selected_only:
+            msg = "선택한 항목 중 다운로드할 수 있는 자막 파일(1건 이상)이 없습니다."
+        elif undownloaded_only:
             msg = "다운로드 대상인 미다운로드 작업이 없습니다. 이미 모든 자막을 다운로드했거나 대상이 존재하지 않습니다."
         else:
             msg = "일괄 다운로드할 완료 작업이 없습니다."
@@ -1057,7 +1067,12 @@ async def _execute_batch_download(
             logger.warning(f"Failed to increment download count for {t_id}: {e}")
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = "transm_undownloaded" if undownloaded_only else "transm_all_subtitles"
+    if selected_only:
+        prefix = "transm_selected_subtitles"
+    elif undownloaded_only:
+        prefix = "transm_undownloaded"
+    else:
+        prefix = "transm_all_subtitles"
     zip_filename = f"{prefix}_{now_str}.zip"
     encoded_filename = urllib.parse.quote(zip_filename, encoding="utf-8")
     content_disposition = f'attachment; filename="transm_subtitles.zip"; filename*=UTF-8\'\'{encoded_filename}'
@@ -1071,6 +1086,15 @@ async def _execute_batch_download(
             "X-Downloaded-Count": str(len(downloaded_ids)),
         }
     )
+
+
+@router.post("/download/batch-selected")
+async def batch_download_selected(req: BatchDownloadRequest):
+    """
+    Creates and streams a ZIP file containing .srt files strictly for user-selected task IDs
+    (whenever 1 or more valid completed tasks are checked).
+    """
+    return await _execute_batch_download(req, undownloaded_only=False, selected_only=True)
 
 
 @router.post("/download/batch-all")

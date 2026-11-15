@@ -138,14 +138,10 @@ export const trackTaskDownload = async (taskId) => {
   return response.data;
 };
 
-export const batchDownloadAll = async (taskIds = null, taskType = null) => {
-  const response = await api.post(
-    '/download/batch-all',
-    { task_ids: taskIds, task_type: taskType },
-    { responseType: 'blob' }
-  );
+const _downloadBatchZip = async (endpoint, payload, defaultFilename) => {
+  const response = await api.post(endpoint, payload, { responseType: 'blob' });
 
-  let targetFilename = `transm_all_subtitles_${new Date().toISOString().slice(0, 10)}.zip`;
+  let targetFilename = defaultFilename;
   const disposition = response.headers?.['content-disposition'];
   if (disposition) {
     const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -167,33 +163,19 @@ export const batchDownloadAll = async (taskIds = null, taskType = null) => {
   return response;
 };
 
+export const batchDownloadAll = async (taskIds = null, taskType = null) => {
+  const defaultName = `transm_all_subtitles_${new Date().toISOString().slice(0, 10)}.zip`;
+  return _downloadBatchZip('/download/batch-all', { task_ids: taskIds, task_type: taskType }, defaultName);
+};
+
 export const batchDownloadUndownloaded = async (taskIds = null, taskType = null) => {
-  const response = await api.post(
-    '/download/batch-undownloaded',
-    { task_ids: taskIds, task_type: taskType },
-    { responseType: 'blob' }
-  );
+  const defaultName = `transm_undownloaded_${new Date().toISOString().slice(0, 10)}.zip`;
+  return _downloadBatchZip('/download/batch-undownloaded', { task_ids: taskIds, task_type: taskType }, defaultName);
+};
 
-  let targetFilename = `transm_subtitles_${new Date().toISOString().slice(0, 10)}.zip`;
-  const disposition = response.headers?.['content-disposition'];
-  if (disposition) {
-    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-    if (utf8Match && utf8Match[1]) {
-      try {
-        targetFilename = decodeURIComponent(utf8Match[1]);
-      } catch (e) {
-        // fallback
-      }
-    } else {
-      const standardMatch = disposition.match(/filename="?([^";]+)"?/i);
-      if (standardMatch && standardMatch[1] && standardMatch[1] !== 'transm_subtitles.zip') {
-        targetFilename = standardMatch[1];
-      }
-    }
-  }
-
-  saveAs(response.data, targetFilename);
-  return response;
+export const batchDownloadSelected = async (taskIds = [], taskType = null) => {
+  const defaultName = `transm_selected_subtitles_${new Date().toISOString().slice(0, 10)}.zip`;
+  return _downloadBatchZip('/download/batch-selected', { task_ids: taskIds, task_type: taskType }, defaultName);
 };
 
 export const getActiveSummary = async () => {

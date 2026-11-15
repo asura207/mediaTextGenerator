@@ -32,7 +32,8 @@ import {
   batchDeleteTasks,
   deleteAllTasks,
   batchDownloadAll,
-  batchDownloadUndownloaded
+  batchDownloadUndownloaded,
+  batchDownloadSelected
 } from '../api/client';
 import VideoPreview from './VideoPreview';
 import SubtitleEditor from './SubtitleEditor';
@@ -53,6 +54,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isBatchDownloadingAll, setIsBatchDownloadingAll] = useState(false);
   const [isBatchDownloadingUndownloaded, setIsBatchDownloadingUndownloaded] = useState(false);
+  const [isBatchDownloadingSelected, setIsBatchDownloadingSelected] = useState(false);
   const [isSyncingDisk, setIsSyncingDisk] = useState(false);
   const playerRef = useRef(null);
   const queryClient = useQueryClient();
@@ -127,6 +129,26 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const unDownloadedInCurrentTab = downloadableInCurrentTab.filter(
     (t) => (t.download_count || 0) === 0 && !t.downloaded
   );
+  const selectedTasksInCurrentTab = filteredTasks.filter((t) => selectedIds.includes(t.task_id));
+  const downloadableSelectedInCurrentTab = selectedTasksInCurrentTab.filter(
+    (t) => (t.subtitle_count || 0) > 0
+  );
+  const isAnyBatchDownloading =
+    isBatchDownloadingAll || isBatchDownloadingUndownloaded || isBatchDownloadingSelected;
+
+  const extractDownloadErrorMessage = async (err, fallbackMsg) => {
+    let errMsg = fallbackMsg;
+    if (err.response?.data instanceof Blob) {
+      try {
+        const text = await err.response.data.text();
+        const json = JSON.parse(text);
+        if (json.detail) errMsg = json.detail;
+      } catch (_) {}
+    } else if (err.response?.data?.detail) {
+      errMsg = err.response.data.detail;
+    }
+    return errMsg;
+  };
 
   const handleBatchDownloadAll = async () => {
     if (downloadableInCurrentTab.length === 0) {
@@ -142,17 +164,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
       await refetch();
     } catch (err) {
       console.error('Batch download all error:', err);
-      let errMsg = '전체 일괄 다운로드 중 오류가 발생했습니다.';
-      if (err.response?.data instanceof Blob) {
-        try {
-          const text = await err.response.data.text();
-          const json = JSON.parse(text);
-          if (json.detail) errMsg = json.detail;
-        } catch (_) {}
-      } else if (err.response?.data?.detail) {
-        errMsg = err.response.data.detail;
-      }
-      alert(errMsg);
+      alert(await extractDownloadErrorMessage(err, '전체 일괄 다운로드 중 오류가 발생했습니다.'));
     } finally {
       setIsBatchDownloadingAll(false);
     }
@@ -172,19 +184,29 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
       await refetch();
     } catch (err) {
       console.error('Batch download undownloaded error:', err);
-      let errMsg = '미다운로드건 일괄 다운로드 중 오류가 발생했습니다.';
-      if (err.response?.data instanceof Blob) {
-        try {
-          const text = await err.response.data.text();
-          const json = JSON.parse(text);
-          if (json.detail) errMsg = json.detail;
-        } catch (_) {}
-      } else if (err.response?.data?.detail) {
-        errMsg = err.response.data.detail;
-      }
-      alert(errMsg);
+      alert(await extractDownloadErrorMessage(err, '미다운로드건 일괄 다운로드 중 오류가 발생했습니다.'));
     } finally {
       setIsBatchDownloadingUndownloaded(false);
+    }
+  };
+
+  const handleBatchDownloadSelected = async () => {
+    if (downloadableSelectedInCurrentTab.length === 0) {
+      alert('선택한 항목 중 다운로드할 수 있는 자막(1건 이상)이 없습니다.');
+      return;
+    }
+
+    setIsBatchDownloadingSelected(true);
+    try {
+      const taskIds = downloadableSelectedInCurrentTab.map((t) => t.task_id);
+      await batchDownloadSelected(taskIds);
+      // Immediately refresh task list to update download counts & colors
+      await refetch();
+    } catch (err) {
+      console.error('Batch download selected error:', err);
+      alert(await extractDownloadErrorMessage(err, '선택 항목 ZIP 다운로드 중 오류가 발생했습니다.'));
+    } finally {
+      setIsBatchDownloadingSelected(false);
     }
   };
 
@@ -706,11 +728,32 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
         </div>
 
         <div className="flex items-center space-x-2.5 flex-wrap gap-y-2">
+          {selectedCountInCurrentTab > 0 && (
+            <button
+              type="button"
+              onClick={handleBatchDownloadSelected}
+              disabled={isAnyBatchDownloading || downloadableSelectedInCurrentTab.length === 0}
+              className="flex items-center space-x-1.5 px-3.5 py-2 text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 rounded-xl transition-all shadow-md shadow-violet-600/30 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
+              title={`체크한 항목 ${downloadableSelectedInCurrentTab.length}건을 ZIP으로 다운로드합니다`}
+            >
+              {isBatchDownloadingSelected ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-white" />
+                  <span>선택 압축 중...</span>
+                </>
+              ) : (
+                <>
+                  <Archive className="w-3.5 h-3.5 text-violet-200" />
+                  <span>선택 다운로드 ({downloadableSelectedInCurrentTab.length}건 .zip)</span>
+                </>
+              )}
+            </button>
+          )}
           {unDownloadedInCurrentTab.length > 0 && (
             <button
               type="button"
               onClick={handleBatchDownloadUndownloaded}
-              disabled={isBatchDownloadingUndownloaded || isBatchDownloadingAll}
+              disabled={isAnyBatchDownloading}
               className="flex items-center space-x-1.5 px-3.5 py-2 text-xs font-bold text-white bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-500 hover:from-emerald-500 hover:to-teal-400 rounded-xl transition-all shadow-md shadow-emerald-600/30 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               title={`현재 탭의 미다운로드 자막 ${unDownloadedInCurrentTab.length}건만 ZIP으로 일괄 다운로드합니다`}
             >
@@ -732,7 +775,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
             <button
               type="button"
               onClick={handleBatchDownloadAll}
-              disabled={isBatchDownloadingAll || isBatchDownloadingUndownloaded}
+              disabled={isAnyBatchDownloading}
               className="flex items-center space-x-1.5 px-3.5 py-2 text-xs font-bold text-white bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 hover:to-indigo-500 rounded-xl transition-all shadow-md shadow-blue-600/30 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               title={`현재 탭의 전체 자막 ${filteredTasks.length}건을 ZIP으로 일괄 다운로드합니다`}
             >
@@ -940,11 +983,36 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
             </div>
           </div>
           <div className="flex items-center space-x-2.5 flex-wrap gap-y-2 flex-shrink-0">
+            {selectedCountInCurrentTab > 0 && (
+              <button
+                type="button"
+                onClick={handleBatchDownloadSelected}
+                disabled={isAnyBatchDownloading || downloadableSelectedInCurrentTab.length === 0}
+                className="flex items-center space-x-1.5 px-3.5 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 rounded-xl transition-all shadow-md shadow-violet-600/25 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
+                title={
+                  downloadableSelectedInCurrentTab.length > 0
+                    ? `체크한 항목 ${downloadableSelectedInCurrentTab.length}건을 ZIP으로 다운로드합니다`
+                    : '체크된 항목 중 다운로드 가능한 자막이 없습니다'
+                }
+              >
+                {isBatchDownloadingSelected ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>선택 항목 압축 중...</span>
+                  </>
+                ) : (
+                  <>
+                    <Archive className="w-3.5 h-3.5 text-violet-200" />
+                    <span>선택 다운로드 ({downloadableSelectedInCurrentTab.length}건 .zip)</span>
+                  </>
+                )}
+              </button>
+            )}
             {unDownloadedInCurrentTab.length > 0 && (
               <button
                 type="button"
                 onClick={handleBatchDownloadUndownloaded}
-                disabled={isBatchDownloadingUndownloaded || isBatchDownloadingAll}
+                disabled={isAnyBatchDownloading}
                 className="flex items-center space-x-1.5 px-3.5 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 rounded-xl transition-all shadow-md shadow-emerald-600/25 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
                 title={`미다운로드 자막 ${unDownloadedInCurrentTab.length}건만 ZIP으로 일괄 다운로드합니다`}
               >
@@ -964,7 +1032,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
             <button
               type="button"
               onClick={handleBatchDownloadAll}
-              disabled={isBatchDownloadingAll || isBatchDownloadingUndownloaded || downloadableInCurrentTab.length === 0}
+              disabled={isAnyBatchDownloading || downloadableInCurrentTab.length === 0}
               className="flex items-center space-x-1.5 px-3.5 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 rounded-xl transition-all shadow-md shadow-blue-600/25 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               title={`현재 탭의 다운로드 가능한 자막 ${downloadableInCurrentTab.length}건을 ZIP으로 일괄 다운로드합니다`}
             >
@@ -994,7 +1062,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
                 type="checkbox"
                 checked={allCurrentPageSelected}
                 onChange={handleToggleSelectCurrentPage}
-                className="w-4 h-4 rounded text-indigo-600 bg-slate-800 border-slate-700 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
+                className="w-4 h-4 rounded accent-indigo-500 text-indigo-600 bg-slate-800 border-slate-700 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
               />
               <span className="text-xs font-semibold text-slate-200">
                 현재 페이지 전체 선택 ({paginatedTasks.length}건)
@@ -1026,18 +1094,43 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
             )}
           </div>
 
-          {/* Right: Delete Action Buttons */}
+          {/* Right: Batch Download Selected & Delete Action Buttons */}
           <div className="flex items-center space-x-2 flex-wrap gap-y-2">
             {selectedCountInCurrentTab > 0 && (
-              <button
-                type="button"
-                onClick={openSelectedDeleteModal}
-                className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold text-rose-300 hover:text-white bg-rose-500/15 hover:bg-rose-600 border border-rose-500/30 rounded-xl transition-all shadow-sm"
-                title={`선택된 ${selectedCountInCurrentTab}개 작업과 자막 삭제`}
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>선택 삭제 ({selectedCountInCurrentTab}건)</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={handleBatchDownloadSelected}
+                  disabled={isAnyBatchDownloading || downloadableSelectedInCurrentTab.length === 0}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold text-white bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 border border-violet-400/40 rounded-xl transition-all shadow-sm shadow-violet-600/25 disabled:opacity-50"
+                  title={
+                    downloadableSelectedInCurrentTab.length > 0
+                      ? `선택된 ${downloadableSelectedInCurrentTab.length}개 자막을 ZIP으로 다운로드`
+                      : '선택한 항목 중 다운로드 가능한 자막이 없습니다'
+                  }
+                >
+                  {isBatchDownloadingSelected ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>압축 중...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Archive className="w-3.5 h-3.5 text-violet-200" />
+                      <span>선택 다운로드 ({downloadableSelectedInCurrentTab.length}건 .zip)</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={openSelectedDeleteModal}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold text-rose-300 hover:text-white bg-rose-500/15 hover:bg-rose-600 border border-rose-500/30 rounded-xl transition-all shadow-sm"
+                  title={`선택된 ${selectedCountInCurrentTab}개 작업과 자막 삭제`}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>선택 삭제 ({selectedCountInCurrentTab}건)</span>
+                </button>
+              </>
             )}
 
             <button
@@ -1083,23 +1176,24 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
                 }`}
               >
                 <div className="flex items-start space-x-3.5 min-w-0">
-                  {/* Checkbox for batch selection */}
+                  {/* Checkbox for batch selection (guard against parent-div + input double toggle) */}
                   <div
                     onClick={(e) => {
                       e.stopPropagation();
-                      toggleSelectTask(task.task_id);
+                      if (e.target.tagName !== 'INPUT') {
+                        toggleSelectTask(task.task_id);
+                      }
                     }}
-                    className="pt-3 pr-1 flex items-center cursor-pointer"
+                    className="p-2 -m-1 flex items-center cursor-pointer flex-shrink-0"
                     title={isSelected ? '선택 해제' : '선택'}
                   >
                     <input
                       type="checkbox"
                       checked={isSelected}
-                      onChange={(e) => {
-                        e.stopPropagation();
-                        toggleSelectTask(task.task_id);
-                      }}
-                      className="w-4 h-4 rounded text-indigo-600 bg-slate-800 border-slate-700 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={() => toggleSelectTask(task.task_id)}
+                      aria-label={`${task.filename || task.task_id} 선택`}
+                      className="w-4 h-4 rounded accent-indigo-500 text-indigo-600 bg-slate-800 border-slate-700 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
                     />
                   </div>
 
