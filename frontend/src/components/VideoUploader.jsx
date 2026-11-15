@@ -28,7 +28,7 @@ import {
   X
 } from 'lucide-react';
 import { browseLocalFolders } from '../api/client';
-import { VALID_EXTENSIONS } from '../hooks/useStudioQueue';
+import { VALID_EXTENSIONS, isSupportedVideoFile, isSubtitleFile } from '../hooks/useStudioQueue';
 
 const PIPELINE_STAGES = [
   { id: 1, name: '1. 오디오 추출', desc: '음원 분리 및 정규화', icon: Music, minPct: 25 },
@@ -175,6 +175,7 @@ export default function VideoUploader({
     const items = dataTransfer.items;
     if (items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function') {
       const files = [];
+      let ignoredSubtitleCount = 0;
 
       const readAllDirectoryEntries = async (reader) => {
         const allEntries = [];
@@ -195,8 +196,11 @@ export default function VideoUploader({
         if (!entry) return;
         const currentRelPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
         if (entry.isFile) {
-          const ext = entry.name.split('.').pop().toLowerCase();
-          if (!VALID_EXTENSIONS.includes(ext)) return;
+          if (isSubtitleFile(entry.name)) {
+            ignoredSubtitleCount += 1;
+            return;
+          }
+          if (!isSupportedVideoFile(entry.name)) return;
           return new Promise((resolve) => {
             entry.file(
               (f) => {
@@ -235,22 +239,21 @@ export default function VideoUploader({
         }
       }
 
-      setIsScanningFolder(true);
-      setScanStatusMsg('드롭한 폴더 및 하위 폴더의 모든 영상을 검색하고 있습니다...');
-      try {
-        for (const entry of rootEntries) {
-          await traverse(entry, '');
+      if (rootEntries.length > 0) {
+        setIsScanningFolder(true);
+        setScanStatusMsg('드롭한 폴더 및 하위 폴더의 모든 영상을 검색하고 있습니다...');
+        try {
+          for (const entry of rootEntries) {
+            await traverse(entry, '');
+          }
+        } finally {
+          setIsScanningFolder(false);
+          setScanStatusMsg('');
         }
-      } finally {
-        setIsScanningFolder(false);
-        setScanStatusMsg('');
-      }
-
-      if (files.length > 0) {
-        return files;
+        return { files, ignoredSubtitleCount };
       }
     }
-    return Array.from(dataTransfer.files || []);
+    return { files: Array.from(dataTransfer.files || []), ignoredSubtitleCount: 0 };
   };
 
   // Recursive folder picker using File System Access API (walks all subfolders without browser file-count limits)
@@ -264,14 +267,16 @@ export default function VideoUploader({
         setScanStatusMsg(`'${dirHandle.name}' 및 모든 하위 폴더에서 동영상을 검색 중...`);
 
         const discoveredFiles = [];
+        let ignoredSubtitleCount = 0;
         const walkDirectoryHandle = async (handle, currentPath) => {
           for await (const entry of handle.values()) {
             if (entry.kind === 'directory') {
               setScanStatusMsg(`하위 폴더 검색 중: ${currentPath}/${entry.name} (${discoveredFiles.length}개 발견)`);
               await walkDirectoryHandle(entry, `${currentPath}/${entry.name}`);
             } else if (entry.kind === 'file') {
-              const ext = entry.name.split('.').pop().toLowerCase();
-              if (VALID_EXTENSIONS.includes(ext)) {
+              if (isSubtitleFile(entry.name)) {
+                ignoredSubtitleCount += 1;
+              } else if (isSupportedVideoFile(entry.name)) {
                 try {
                   const file = await entry.getFile();
                   Object.defineProperty(file, 'relativePath', {
@@ -290,10 +295,14 @@ export default function VideoUploader({
         setScanStatusMsg('');
 
         if (discoveredFiles.length === 0) {
-          setWarningMsg(`선택한 폴더('${dirHandle.name}') 및 하위 폴더에 지원되는 동영상 파일이 없습니다.`);
+          const subMsg =
+            ignoredSubtitleCount > 0
+              ? ` (기존 자막 파일 ${ignoredSubtitleCount}개(.smi/.srt 등)는 제외됨)`
+              : '';
+          setWarningMsg(`선택한 폴더('${dirHandle.name}') 및 하위 폴더에 지원되는 동영상 파일이 없습니다.${subMsg}`);
           return;
         }
-        processSelectedFiles(discoveredFiles);
+        processSelectedFiles(discoveredFiles, ignoredSubtitleCount);
         return;
       } catch (err) {
         setIsScanningFolder(false);
@@ -344,8 +353,12 @@ export default function VideoUploader({
       const res = await onAddServerFolder(target);
       setShowFolderModal(false);
       const subText = res.subfolder_count > 0 ? ` (하위 폴더 ${res.subfolder_count}곳 포함)` : '';
+      const ignoredSubText =
+        res.ignored_subtitle_count > 0
+          ? ` [기존 자막 파일 ${res.ignored_subtitle_count}개(.smi/.srt 등) 제외]`
+          : '';
       setInfoMsg(
-        `'${res.folder_name}'${subText}에서 동영상 총 ${res.total_found}개를 검색하여 ${res.added_count}개를 작업 대기열에 등록했습니다.`
+        `'${res.folder_name}'${subText}에서 동영상 총 ${res.total_found}개를 검색하여 ${res.added_count}개를 작업 대기열에 등록했습니다.${ignoredSubText}`
       );
     } catch (err) {
       setFolderModalError(err.response?.data?.detail || err.message || '하위 폴더 영상 검색에 실패했습니다.');
@@ -367,7 +380,7 @@ export default function VideoUploader({
               <div>
                 <h3 className="text-sm font-bold text-white">폴더 지정 (하위 폴더 전체 동영상 자동 검색)</h3>
                 <p className="text-[11px] text-slate-400">
-                  지정한 폴더와 그 안의 모든 하위 폴더를 끝까지 검색하여 동영상을 한 번에 작업큐에 담습니다.
+                  기존 자막 파일(.smi, .srt 등)은 자동 무시하고 지정한 폴더와 하위 폴더의 동영상 파일만 수집해 작업큐에 등록합니다.
                 </p>
               </div>
             </div>
@@ -527,9 +540,16 @@ export default function VideoUploader({
     e.stopPropagation();
     setDragActive(false);
     if (e.dataTransfer) {
-      const files = await extractFilesFromDataTransfer(e.dataTransfer);
+      const { files, ignoredSubtitleCount } = await extractFilesFromDataTransfer(e.dataTransfer);
       if (files && files.length > 0) {
-        processSelectedFiles(files);
+        processSelectedFiles(files, ignoredSubtitleCount);
+      } else {
+        setInfoMsg('');
+        setWarningMsg(
+          ignoredSubtitleCount > 0
+            ? `기존 자막 파일 ${ignoredSubtitleCount}개(.smi, .srt 등)는 제외되었으며, 지원되는 동영상 파일이 없습니다.`
+            : '드롭한 항목에 지원되는 동영상 파일이 없습니다.'
+        );
       }
     }
   };
@@ -541,16 +561,21 @@ export default function VideoUploader({
     }
   };
 
-  const processSelectedFiles = (files) => {
+  const processSelectedFiles = (files, externalIgnoredSubCount = 0) => {
     setWarningMsg('');
     setInfoMsg('');
     if (!onAddVideos) return;
     const res = onAddVideos(files);
+    const totalIgnored = (res?.ignoredSubtitleCount || 0) + externalIgnoredSubCount;
     if (res?.warning) {
       setWarningMsg(res.warning);
     }
     if (res?.info && !res?.warning) {
-      setInfoMsg(res.info);
+      const extraIgnored =
+        externalIgnoredSubCount > 0 && !(res.ignoredSubtitleCount > 0)
+          ? ` (기존 자막 파일 ${totalIgnored}개 제외)`
+          : '';
+      setInfoMsg(`${res.info}${extraIgnored}`);
     }
   };
 

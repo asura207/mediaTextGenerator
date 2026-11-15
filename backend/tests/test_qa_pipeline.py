@@ -499,6 +499,98 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "중국어 누출 시 다중 턴 자가 교정 피드백으로 100% 한글 복구 & 전각 기호 정규화 & 가나 음차 폴백 통과",
         })
 
+    def test_8_folder_sync_ignores_subtitles_and_registers_videos_only(self):
+        """
+        [Case 8] 폴더 동기화 시 smi/srt 등 기존 자막 파일 무시 및 동영상 전용 등록 검증:
+        _scan_folder_recursive_sync, find_video_file_on_server, upsert_studio_queue_items가
+        .smi/.srt/.ass/.vtt 자막 파일은 완전히 무시하고 영상 파일만 수집·등록하는지 검증.
+        """
+        from unittest.mock import patch
+        from app.api.routes import (
+            _scan_folder_recursive_sync,
+            find_video_file_on_server,
+            is_supported_video_filename,
+        )
+
+        self.assertTrue(is_supported_video_filename("movie.mp4"))
+        self.assertTrue(is_supported_video_filename("sub/episode_01.avi"))
+        self.assertFalse(is_supported_video_filename("movie.smi"))
+        self.assertFalse(is_supported_video_filename("movie.srt"))
+        self.assertFalse(is_supported_video_filename("movie.ass"))
+        self.assertFalse(is_supported_video_filename("movie.vtt"))
+
+        orig_engine = db_module._engine
+        orig_is_sqlite = db_module._is_sqlite
+        orig_db_name = db_module._connected_db_name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            media_root = tmp_path / "Series"
+            sub_dir = media_root / "Season1"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+
+            # 영상 + 기존 자막(.smi, .srt, .ass) + 이미지 혼합 생성
+            (media_root / "ep01.mkv").write_bytes(b"video_01")
+            (media_root / "ep01.smi").write_text("<SAMI></SAMI>", encoding="utf-8")
+            (media_root / "ep01.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nhi\n", encoding="utf-8")
+            (sub_dir / "ep02.avi").write_bytes(b"video_02")
+            (sub_dir / "ep02.SMI").write_text("<SAMI></SAMI>", encoding="utf-8")
+            (sub_dir / "ep02.ass").write_text("[Script Info]\n", encoding="utf-8")
+            (sub_dir / "poster.jpg").write_bytes(b"jpg_bytes")
+
+            discovered, subfolders, ignored_sub_count = _scan_folder_recursive_sync(media_root)
+            collected_names = [d["base_name"] for d in discovered]
+
+            self.assertEqual(collected_names, ["ep01.mkv", "ep02.avi"])
+            self.assertEqual(ignored_sub_count, 4)
+            self.assertEqual(subfolders, {"Season1"})
+
+            # find_video_file_on_server가 .smi/.srt 파일은 절대 반환하지 않는지 검증
+            with patch("app.api.routes.get_media_scan_dirs", return_value=[media_root]):
+                self.assertIsNone(find_video_file_on_server("ep01.smi"))
+                self.assertIsNone(find_video_file_on_server("ep01.srt"))
+                resolved_ep01 = find_video_file_on_server("ep01.mkv")
+                self.assertIsNotNone(resolved_ep01)
+                self.assertEqual(resolved_ep01.name, "ep01.mkv")
+
+            # DB upsert_studio_queue_items가 자막 파일을 차단하고 영상만 등록하는지 검증
+            temp_db_path = tmp_path / "qa_test_folder_sync.sqlite3"
+            try:
+                test_engine = create_engine(
+                    f"sqlite:///{temp_db_path.as_posix()}",
+                    connect_args={"check_same_thread": False, "timeout": 30.0},
+                )
+                db_module._configure_sqlite_pragma(test_engine)
+                db_module._engine = test_engine
+                db_module._is_sqlite = True
+                db_module._connected_db_name = str(temp_db_path)
+                init_db()
+
+                mixed_items = [
+                    {"id": "q1", "filename": "ep01.mkv", "size": 8, "status": "WAITING"},
+                    {"id": "q2", "filename": "ep01.smi", "size": 13, "status": "WAITING"},
+                    {"id": "q3", "filename": "Series/Season1/ep02.avi", "size": 8, "status": "WAITING"},
+                    {"id": "q4", "filename": "Series/Season1/ep02.srt", "size": 30, "status": "WAITING"},
+                ]
+                db_module.upsert_studio_queue_items(mixed_items, client_id="test_sync")
+                saved_q = db_module.get_studio_queue()
+                saved_names = [it["filename"] for it in saved_q]
+                self.assertEqual(saved_names, ["ep01.mkv", "Series/Season1/ep02.avi"])
+
+                test_engine.dispose()
+            finally:
+                db_module._engine = orig_engine
+                db_module._is_sqlite = orig_is_sqlite
+                db_module._connected_db_name = orig_db_name
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "8. 폴더 동기화 자막(.smi/.srt) 무시 · 영상 전용 등록",
+            "status": "PASS",
+            "input": "ep01.mkv, ep01.smi, ep01.srt, Season1/ep02.avi, ep02.SMI, ep02.ass, poster.jpg",
+            "output": f"수집={collected_names}, 제외자막={ignored_sub_count}건, 큐저장={saved_names}",
+            "detail": "재귀 스캔·서버 영상 인덱스·DB 큐 저장 전 계층에서 .smi/.srt/.ass 제외 및 영상 전용 등록 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)

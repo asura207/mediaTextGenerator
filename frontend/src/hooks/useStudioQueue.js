@@ -15,6 +15,22 @@ export const VALID_EXTENSIONS = [
   'mp4', 'mkv', 'mov', 'avi', 'webm', 'flv', 'wmv', 'asf',
   'ts', 'm4v', 'mpg', 'mpeg', 'm2ts', 'mts', 'vob', 'ogv', '3gp'
 ];
+export const SUBTITLE_EXTENSIONS = [
+  'smi', 'sami', 'srt', 'ass', 'ssa', 'vtt', 'sub', 'idx', 'sup', 'lrc'
+];
+
+export function isSupportedVideoFile(filename) {
+  if (!filename || typeof filename !== 'string' || !filename.includes('.')) return false;
+  const ext = filename.split('.').pop().toLowerCase();
+  return !SUBTITLE_EXTENSIONS.includes(ext) && VALID_EXTENSIONS.includes(ext);
+}
+
+export function isSubtitleFile(filename) {
+  if (!filename || typeof filename !== 'string' || !filename.includes('.')) return false;
+  const ext = filename.split('.').pop().toLowerCase();
+  return SUBTITLE_EXTENSIONS.includes(ext);
+}
+
 const MAX_BATCH_SIZE = 5000;
 
 export function useStudioQueue({ onTaskCompleted }) {
@@ -56,21 +72,24 @@ export function useStudioQueue({ onTaskCompleted }) {
         .replace(/^\/+/, '');
 
     const videoFiles = [];
-    const nonVideoFiles = [];
+    let ignoredSubtitleCount = 0;
 
     rawFiles.forEach((file) => {
-      const ext = file.name.split('.').pop().toLowerCase();
-      if (VALID_EXTENSIONS.includes(ext)) {
+      if (isSupportedVideoFile(file.name)) {
         videoFiles.push(file);
-      } else {
-        nonVideoFiles.push(file.name);
+      } else if (isSubtitleFile(file.name)) {
+        ignoredSubtitleCount += 1;
       }
     });
 
     if (videoFiles.length === 0) {
       return {
         count: 0,
-        warning: '선택한 폴더(하위 폴더 포함) 또는 파일에 지원되는 동영상 파일이 없습니다.',
+        ignoredSubtitleCount,
+        warning:
+          ignoredSubtitleCount > 0
+            ? `기존 자막 파일 ${ignoredSubtitleCount}개(.smi, .srt 등)는 제외되었으며, 지원되는 동영상 파일이 없습니다.`
+            : '선택한 폴더(하위 폴더 포함) 또는 파일에 지원되는 동영상 파일이 없습니다.',
         info: null
       };
     }
@@ -139,13 +158,16 @@ export function useStudioQueue({ onTaskCompleted }) {
       return updated;
     });
 
+    const ignoredText =
+      ignoredSubtitleCount > 0 ? ` (기존 자막 파일 ${ignoredSubtitleCount}개 제외)` : '';
     const folderInfo =
       subfolderSet.size > 1
-        ? `하위 폴더 ${subfolderSet.size}곳을 모두 검색하여 동영상 총 ${validItems.length}개가 대기열에 등록되었습니다.`
-        : `동영상 ${validItems.length}개가 대기열에 등록되었습니다.`;
+        ? `하위 폴더 ${subfolderSet.size}곳에서 동영상 총 ${validItems.length}개가 대기열에 등록되었습니다.${ignoredText}`
+        : `동영상 ${validItems.length}개가 대기열에 등록되었습니다.${ignoredText}`;
 
     return {
       count: validItems.length,
+      ignoredSubtitleCount,
       warning,
       info: folderInfo
     };

@@ -683,6 +683,23 @@ def get_studio_queue() -> List[Dict[str, Any]]:
         return []
 
 
+_VALID_VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts",
+    ".webm", ".m4v", ".mpg", ".mpeg", ".m2ts", ".mts", ".vob", ".ogv", ".3gp"
+}
+_IGNORED_SUBTITLE_EXTS = {
+    ".smi", ".sami", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".lrc"
+}
+
+
+def _is_video_filename(filename: Optional[str]) -> bool:
+    """Returns True only when filename has a supported video extension (never .smi/.srt)."""
+    if not filename:
+        return False
+    ext = Path(str(filename).replace("\\", "/")).suffix.lower()
+    return bool(ext) and ext not in _IGNORED_SUBTITLE_EXTS and ext in _VALID_VIDEO_EXTS
+
+
 def upsert_studio_queue_items(items: List[Dict[str, Any]], client_id: Optional[str] = None) -> bool:
     """Upserts a list of queue items into studio_queue_items. Completed items are automatically removed."""
     if not items:
@@ -730,9 +747,13 @@ def upsert_studio_queue_items(items: List[Dict[str, Any]], client_id: Optional[s
                     )
                     continue
 
+                item_filename = str(it.get("filename") or "")
+                if not _is_video_filename(item_filename):
+                    continue
+
                 params = {
                     "id": item_id,
-                    "filename": str(it.get("filename") or ""),
+                    "filename": item_filename,
                     "size": int(it.get("size") or 0),
                     "status": item_status,
                     "upload_progress": int(it.get("upload_progress") if it.get("upload_progress") is not None else (it.get("uploadProgress") or 0)),
@@ -904,29 +925,28 @@ def requeue_all_completed_studio_tasks(reset_processing: bool = False) -> Dict[s
             if r[0]:
                 purged_task_ids.add(str(r[0]))
 
-        # 4. Build comprehensive candidate set of (filename -> task_id)
+        # 4. Build comprehensive candidate set of (filename -> task_id) - videos only
         candidate_map: Dict[str, str] = {}
         for tid, fname in completed_rows:
-            if fname and fname not in candidate_map:
+            if fname and _is_video_filename(fname) and fname not in candidate_map:
                 candidate_map[fname] = tid
 
         for r in res_tasks:
             if r[0] and r[1]:
                 fn = str(r[1])
-                if fn not in candidate_map:
+                if _is_video_filename(fn) and fn not in candidate_map:
                     candidate_map[fn] = str(r[0])
 
         # Also inspect UPLOAD_DIR for uploaded video files
         try:
             from app.config import UPLOAD_DIR
-            valid_exts = {'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'ts', 'webm', 'm4v', 'mpg', 'mpeg', 'm2ts', 'mts', 'vob', 'ogv', '3gp'}
             if UPLOAD_DIR.exists():
                 for f in UPLOAD_DIR.iterdir():
-                    if f.is_file() and f.stat().st_size > 0 and f.suffix.lower().lstrip('.') in valid_exts:
+                    if f.is_file() and f.stat().st_size > 0 and _is_video_filename(f.name):
                         clean_fn = f.name
                         if "_" in clean_fn and len(clean_fn.split("_")[0]) in (32, 36):
                             clean_fn = clean_fn.split("_", 1)[1]
-                        if clean_fn not in candidate_map:
+                        if _is_video_filename(clean_fn) and clean_fn not in candidate_map:
                             candidate_map[clean_fn] = f"upload_{f.stem[:8]}"
         except Exception:
             pass

@@ -208,6 +208,15 @@ VALID_VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv",
     ".asf", ".ts", ".m4v", ".mpg", ".mpeg", ".m2ts", ".mts", ".vob", ".ogv", ".3gp"
 }
+IGNORED_SUBTITLE_EXTENSIONS = {
+    ".smi", ".sami", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".lrc"
+}
+
+
+def is_supported_video_filename(name_or_path: Any) -> bool:
+    """Returns True only for supported video files, explicitly rejecting .smi/.srt/etc. subtitles."""
+    ext = Path(str(name_or_path or "")).suffix.lower()
+    return bool(ext) and ext not in IGNORED_SUBTITLE_EXTENSIONS and ext in VALID_VIDEO_EXTENSIONS
 
 
 def find_video_file_on_server(filename: str) -> Optional[Path]:
@@ -216,15 +225,24 @@ def find_video_file_on_server(filename: str) -> Optional[Path]:
     Supports absolute paths, subfolder relative paths (e.g. 'SubFolder/01.mkv'), and base filenames.
     Checks UPLOAD_DIR first, then checks known local source media directories using an os.walk index
     (safe against special glob characters like '[' and ']').
+    Strictly ignores subtitle files (.smi, .srt, etc.) so only real video files are returned.
     """
     global _LOCAL_MEDIA_INDEX, _LOCAL_MEDIA_ALL_PATHS, _LOCAL_MEDIA_INDEX_TS
     if not filename:
+        return None
+    if Path(filename.replace("\\", "/")).suffix.lower() in IGNORED_SUBTITLE_EXTENSIONS:
         return None
 
     # 0. Check if filename is already a valid absolute or direct path on disk
     try:
         direct_candidate = Path(filename)
-        if direct_candidate.is_absolute() and direct_candidate.exists() and direct_candidate.is_file() and direct_candidate.stat().st_size > 0:
+        if (
+            direct_candidate.is_absolute()
+            and direct_candidate.exists()
+            and direct_candidate.is_file()
+            and direct_candidate.stat().st_size > 0
+            and is_supported_video_filename(direct_candidate)
+        ):
             return direct_candidate
     except Exception:
         pass
@@ -234,29 +252,40 @@ def find_video_file_on_server(filename: str) -> Optional[Path]:
     # 1. Check UPLOAD_DIR safely via iterdir (handles '[' and ']' in filenames)
     try:
         for f in UPLOAD_DIR.iterdir():
-            if f.is_file() and f.stat().st_size > 0 and (f.name == base_name or f.name.endswith(f"_{base_name}")):
+            if (
+                f.is_file()
+                and f.stat().st_size > 0
+                and is_supported_video_filename(f)
+                and (f.name == base_name or f.name.endswith(f"_{base_name}"))
+            ):
                 return f
     except Exception:
         pass
 
     # 2. Check cached local media index (by exact filename / relative path)
     cached = _LOCAL_MEDIA_INDEX.get(filename)
-    if cached and cached.exists() and cached.is_file() and cached.stat().st_size > 0:
+    if cached and cached.exists() and cached.is_file() and cached.stat().st_size > 0 and is_supported_video_filename(cached):
         return cached
 
-    # 3. Refresh local media index if needed (throttled to once every 10s)
+    # 3. Refresh local media index if needed (throttled to once every 10s) - index ONLY video files
     now = time.time()
     if now - _LOCAL_MEDIA_INDEX_TS > 10.0 or not _LOCAL_MEDIA_INDEX:
         _LOCAL_MEDIA_INDEX_TS = now
         search_roots = get_media_scan_dirs()
-        new_index: Dict[str, Path] = dict(_LOCAL_MEDIA_INDEX)
-        all_paths: List[Any] = list(_LOCAL_MEDIA_ALL_PATHS)
+        new_index: Dict[str, Path] = {
+            k: v for k, v in _LOCAL_MEDIA_INDEX.items() if is_supported_video_filename(v)
+        }
+        all_paths: List[Any] = [
+            (norm_p, fp) for norm_p, fp in _LOCAL_MEDIA_ALL_PATHS if is_supported_video_filename(fp)
+        ]
         seen_full = {p_str for p_str, _ in all_paths}
         for root in search_roots:
             try:
                 if root.exists():
                     for dirpath, _, filenames in os.walk(str(root)):
                         for fn in filenames:
+                            if not is_supported_video_filename(fn):
+                                continue
                             full_p = Path(dirpath) / fn
                             norm_full = str(full_p).replace("\\", "/").lower()
                             if norm_full not in seen_full:
@@ -274,19 +303,31 @@ def find_video_file_on_server(filename: str) -> Optional[Path]:
     if "/" in norm_query:
         suffix = "/" + norm_query
         for norm_full, full_p in _LOCAL_MEDIA_ALL_PATHS:
-            if norm_full.endswith(suffix) and full_p.exists() and full_p.is_file() and full_p.stat().st_size > 0:
+            if (
+                norm_full.endswith(suffix)
+                and full_p.exists()
+                and full_p.is_file()
+                and full_p.stat().st_size > 0
+                and is_supported_video_filename(full_p)
+            ):
                 _LOCAL_MEDIA_INDEX[filename] = full_p
                 return full_p
 
     cached = _LOCAL_MEDIA_INDEX.get(filename) or _LOCAL_MEDIA_INDEX.get(base_name)
-    if cached and cached.exists() and cached.is_file() and cached.stat().st_size > 0:
+    if cached and cached.exists() and cached.is_file() and cached.stat().st_size > 0 and is_supported_video_filename(cached):
         return cached
 
-    # Fallback: partial stem match in _LOCAL_MEDIA_INDEX
+    # Fallback: partial stem match in _LOCAL_MEDIA_INDEX (strictly videos only)
     stem = Path(base_name).stem
     if stem:
         for fn, fpath in _LOCAL_MEDIA_INDEX.items():
-            if stem in fn and fpath.exists() and fpath.is_file() and fpath.stat().st_size > 0:
+            if (
+                stem in fn
+                and fpath.exists()
+                and fpath.is_file()
+                and fpath.stat().st_size > 0
+                and is_supported_video_filename(fpath)
+            ):
                 return fpath
 
     return None
@@ -585,6 +626,12 @@ async def upload_video(
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
+
+    if not is_supported_video_filename(file.filename):
+        raise HTTPException(
+            status_code=400,
+            detail=f"자막 파일(.smi, .srt 등) 및 비지원 형식은 제외되며 동영상 파일만 등록할 수 있습니다: {file.filename}"
+        )
 
     task_id = str(uuid.uuid4())
     sanitized_filename = Path(file.filename.replace("\\", "/")).name
@@ -1793,9 +1840,14 @@ async def get_studio_queue_endpoint():
 
 @router.post("/studio-queue/sync")
 async def sync_studio_queue_endpoint(payload: StudioQueueSyncRequest):
-    """Syncs the queue items from a client browser to the server database."""
+    """Syncs the queue items from a client browser to the server database (strictly videos only)."""
     if payload.items:
-        db.upsert_studio_queue_items(payload.items, client_id=payload.client_id)
+        video_only_items = [
+            it for it in payload.items
+            if is_supported_video_filename(it.get("filename"))
+        ]
+        if video_only_items:
+            db.upsert_studio_queue_items(video_only_items, client_id=payload.client_id)
     return await get_studio_queue_endpoint()
 
 
@@ -1834,14 +1886,14 @@ def _natural_sort_key(text_val: str):
 
 
 def _browse_folders_sync(target_dir: Path) -> tuple[List[Dict[str, str]], int]:
-    """Scans direct entries in folder using worker thread."""
+    """Scans direct entries in folder using worker thread (counts videos only, ignoring .smi/.srt)."""
     folders = []
     direct_video_count = 0
     for entry in target_dir.iterdir():
         try:
             if entry.is_dir() and not entry.name.startswith("$"):
                 folders.append({"name": entry.name, "path": str(entry)})
-            elif entry.is_file() and entry.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            elif entry.is_file() and is_supported_video_filename(entry.name):
                 direct_video_count += 1
         except Exception:
             continue
@@ -1900,52 +1952,62 @@ async def browse_local_folders_endpoint(path: Optional[str] = None):
     }
 
 
-def _scan_folder_recursive_sync(root_dir: Path) -> tuple[List[Dict[str, Any]], set[str]]:
-    """Worker thread scanner that recursively finds videos without blocking event loop."""
+def _scan_folder_recursive_sync(root_dir: Path) -> tuple[List[Dict[str, Any]], set[str], int]:
+    """
+    Worker thread scanner that recursively collects ONLY supported video files without blocking event loop.
+    Explicitly ignores existing subtitle files (.smi, .srt, .ass, .vtt, etc.) and counts how many were skipped.
+    """
     discovered_videos = []
     subfolders_with_videos = set()
+    ignored_subtitle_count = 0
 
     for dirpath, _, filenames in os.walk(str(root_dir)):
         for fn in filenames:
             ext = Path(fn).suffix.lower()
-            if ext in VALID_VIDEO_EXTENSIONS:
-                full_path = Path(dirpath) / fn
-                try:
-                    fsize = full_path.stat().st_size
-                except Exception:
-                    fsize = 0
-                if fsize <= 0:
-                    continue
+            if ext in IGNORED_SUBTITLE_EXTENSIONS:
+                ignored_subtitle_count += 1
+                continue
+            if not is_supported_video_filename(fn):
+                continue
 
-                try:
-                    rel_to_root = full_path.relative_to(root_dir)
-                    rel_str = str(rel_to_root).replace("\\", "/")
-                except Exception:
-                    rel_str = fn
+            full_path = Path(dirpath) / fn
+            try:
+                fsize = full_path.stat().st_size
+            except Exception:
+                fsize = 0
+            if fsize <= 0:
+                continue
 
-                if "/" in rel_str:
-                    subfolders_with_videos.add(str(Path(rel_str).parent))
-                    display_name = f"{root_dir.name}/{rel_str}"
-                else:
-                    display_name = fn
+            try:
+                rel_to_root = full_path.relative_to(root_dir)
+                rel_str = str(rel_to_root).replace("\\", "/")
+            except Exception:
+                rel_str = fn
 
-                discovered_videos.append({
-                    "full_path": full_path,
-                    "rel_sort_key": rel_str,
-                    "display_name": display_name,
-                    "base_name": fn,
-                    "size": fsize
-                })
+            if "/" in rel_str:
+                subfolders_with_videos.add(str(Path(rel_str).parent))
+                display_name = f"{root_dir.name}/{rel_str}"
+            else:
+                display_name = fn
+
+            discovered_videos.append({
+                "full_path": full_path,
+                "rel_sort_key": rel_str,
+                "display_name": display_name,
+                "base_name": fn,
+                "size": fsize
+            })
 
     discovered_videos.sort(key=lambda x: _natural_sort_key(x["rel_sort_key"]))
-    return discovered_videos, subfolders_with_videos
+    return discovered_videos, subfolders_with_videos, ignored_subtitle_count
 
 
 @router.post("/studio-queue/add-folder")
 async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, background_tasks: BackgroundTasks):
     """
     Recursively searches the specified folder and ALL its subfolders (os.walk),
-    registers every discovered video file into studio_queue_items in natural order,
+    ignores any existing subtitle files (.smi, .srt, .ass, .vtt, etc.),
+    registers ONLY discovered video files into studio_queue_items in natural order,
     and automatically starts processing!
     """
     global _LOCAL_MEDIA_INDEX, _LOCAL_MEDIA_ALL_PATHS
@@ -1958,18 +2020,27 @@ async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, backgr
         raise HTTPException(status_code=404, detail=f"폴더가 존재하지 않습니다: {raw_path}")
 
     # Run heavy directory scan off the main event loop
-    discovered_videos, subfolders_with_videos = await run_in_threadpool(_scan_folder_recursive_sync, root_dir)
+    discovered_videos, subfolders_with_videos, ignored_subtitle_count = await run_in_threadpool(
+        _scan_folder_recursive_sync, root_dir
+    )
 
     if not discovered_videos:
+        sub_skip_msg = (
+            f" (기존 자막 파일 {ignored_subtitle_count}개(.smi/.srt 등)는 제외됨)"
+            if ignored_subtitle_count > 0
+            else ""
+        )
         raise HTTPException(
             status_code=400,
-            detail=f"선택한 폴더('{root_dir.name}') 및 하위 폴더에 지원되는 동영상 파일이 없습니다."
+            detail=f"선택한 폴더('{root_dir.name}') 및 하위 폴더에 지원되는 동영상 파일이 없습니다.{sub_skip_msg}"
         )
 
     # Get existing queue to append after current items and avoid exact duplicate waiting items
     existing_items = await run_in_threadpool(db.get_studio_queue)
     existing_waiting_names = {
-        it.get("filename") for it in existing_items if it.get("status") in ("WAITING", "PROCESSING", "UPLOADING")
+        str(it.get("filename") or "").replace("\\", "/")
+        for it in existing_items
+        if it.get("status") in ("WAITING", "PROCESSING", "UPLOADING")
     }
     base_order = len(existing_items)
 
@@ -2022,6 +2093,7 @@ async def add_folder_to_studio_queue_endpoint(payload: ScanFolderRequest, backgr
     return {
         "added_count": len(new_queue_items),
         "total_found": len(discovered_videos),
+        "ignored_subtitle_count": ignored_subtitle_count,
         "subfolder_count": len(subfolders_with_videos),
         "folder_name": root_dir.name or str(root_dir),
         "queue_state": queue_state
