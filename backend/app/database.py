@@ -538,6 +538,45 @@ def increment_download_count(task_id: str) -> int:
         return 1
 
 
+def _resolve_video_folder(
+    filename: Optional[str],
+    video_path: Optional[str],
+    srt_path: Optional[str],
+) -> str:
+    """
+    Resolves a human-readable video folder category for a completed task.
+    Prefers real disk video parent directory, then relative subfolder in filename,
+    then non-internal srt_path parent directory, and falls back to upload bucket.
+    """
+    vp_str = str(video_path or "").strip()
+    fn_str = str(filename or "").strip()
+    sp_str = str(srt_path or "").strip()
+
+    if vp_str:
+        norm_vp = vp_str.replace("\\", "/").lower()
+        if "/data/uploads/" not in norm_vp and not norm_vp.endswith("/data/uploads"):
+            parent = str(Path(vp_str).parent)
+            if parent and parent != ".":
+                return parent
+
+    if fn_str and ("/" in fn_str or "\\" in fn_str):
+        norm_fn = fn_str.replace("\\", "/").lstrip("/")
+        parent_fn = str(Path(norm_fn).parent).replace("\\", "/")
+        if parent_fn and parent_fn != ".":
+            return parent_fn
+
+    if sp_str:
+        norm_sp = sp_str.replace("\\", "/").lower()
+        if "/data/processed/" not in norm_sp and not norm_sp.endswith("/data/processed"):
+            parent_sp = str(Path(sp_str).parent)
+            if parent_sp and parent_sp != ".":
+                return parent_sp
+
+    if vp_str and "/data/uploads/" in vp_str.replace("\\", "/").lower():
+        return "직접 업로드 (uploads)"
+    return "기타 / 직접 업로드"
+
+
 def get_completed_tasks(
     limit: int = 10000,
     task_type: Optional[str] = None,
@@ -547,18 +586,24 @@ def get_completed_tasks(
     engine = get_engine()
     if task_type:
         sql = """
-        SELECT task_id, filename, subtitle_count, srt_path, srt_download_url, task_type, completed_at, download_count, last_downloaded_at
-        FROM completed_tasks
-        WHERE task_type = :task_type
-        ORDER BY completed_at DESC
+        SELECT c.task_id, c.filename, c.subtitle_count, c.srt_path, c.srt_download_url,
+               c.task_type, c.completed_at, c.download_count, c.last_downloaded_at,
+               t.video_path
+        FROM completed_tasks c
+        LEFT JOIN transm_tasks t ON c.task_id = t.task_id
+        WHERE c.task_type = :task_type
+        ORDER BY c.completed_at DESC
         LIMIT :limit OFFSET :offset;
         """
         params = {"limit": limit, "task_type": task_type, "offset": offset}
     else:
         sql = """
-        SELECT task_id, filename, subtitle_count, srt_path, srt_download_url, task_type, completed_at, download_count, last_downloaded_at
-        FROM completed_tasks
-        ORDER BY completed_at DESC
+        SELECT c.task_id, c.filename, c.subtitle_count, c.srt_path, c.srt_download_url,
+               c.task_type, c.completed_at, c.download_count, c.last_downloaded_at,
+               t.video_path
+        FROM completed_tasks c
+        LEFT JOIN transm_tasks t ON c.task_id = t.task_id
+        ORDER BY c.completed_at DESC
         LIMIT :limit OFFSET :offset;
         """
         params = {"limit": limit, "offset": offset}
@@ -588,6 +633,11 @@ def get_completed_tasks(
                     row_dict["task_type"] = "translator"
                 else:
                     row_dict["task_type"] = "studio"
+            row_dict["video_folder"] = _resolve_video_folder(
+                row_dict.get("filename"),
+                row_dict.get("video_path"),
+                row_dict.get("srt_path"),
+            )
             result.append(row_dict)
         return result
 

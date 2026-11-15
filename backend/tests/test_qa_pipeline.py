@@ -591,6 +591,107 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "재귀 스캔·서버 영상 인덱스·DB 큐 저장 전 계층에서 .smi/.srt/.ass 제외 및 영상 전용 등록 통과",
         })
 
+    def test_9_completed_tasks_video_folder_metadata(self):
+        """
+        [Case 9] 작업완료 보관함 영상 폴더별 조회용 video_folder 메타데이터 검증:
+        get_completed_tasks()가 transm_tasks.video_path, 상대 경로 filename, 디스크 srt_path를
+        기준으로 정확한 video_folder 값을 반환하는지 검증.
+        """
+        orig_engine = db_module._engine
+        orig_is_sqlite = db_module._is_sqlite
+        orig_db_name = db_module._connected_db_name
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            temp_db_path = tmp_path / "qa_test_folders.sqlite3"
+            try:
+                test_engine = create_engine(
+                    f"sqlite:///{temp_db_path.as_posix()}",
+                    connect_args={"check_same_thread": False, "timeout": 30.0},
+                )
+                db_module._configure_sqlite_pragma(test_engine)
+                db_module._engine = test_engine
+                db_module._is_sqlite = True
+                db_module._connected_db_name = str(temp_db_path)
+                init_db()
+
+                # 1. 로컬 디스크 영상 경로가 있는 스튜디오 완료건
+                db_module.upsert_task(
+                    task_id="t_disk",
+                    filename="City Hunter/Angel Heart/ep22.avi",
+                    status="COMPLETED",
+                    stage="완료",
+                    progress=100,
+                    video_path=r"D:\애니메이션\City Hunter\Angel Heart\ep22.avi",
+                    srt_path=r"D:\dev\sourceCode\transM\backend\data\processed\t_disk.srt",
+                )
+                db_module.add_completed_task(
+                    "t_disk", "City Hunter/Angel Heart/ep22.avi", 10,
+                    r"D:\dev\sourceCode\transM\backend\data\processed\t_disk.srt",
+                    "/api/download/t_disk", "studio"
+                )
+
+                # 2. 브라우저 업로드 경로지만 filename에 하위 폴더가 있는 경우
+                db_module.upsert_task(
+                    task_id="t_rel",
+                    filename="City Hunter/Movie.mkv",
+                    status="COMPLETED",
+                    stage="완료",
+                    progress=100,
+                    video_path=r"D:\dev\sourceCode\transM\backend\data\uploads\t_rel_Movie.mkv",
+                    srt_path=r"D:\dev\sourceCode\transM\backend\data\processed\t_rel.srt",
+                )
+                db_module.add_completed_task(
+                    "t_rel", "City Hunter/Movie.mkv", 20,
+                    r"D:\dev\sourceCode\transM\backend\data\processed\t_rel.srt",
+                    "/api/download/t_rel", "studio"
+                )
+
+                # 3. 디스크 자막 경로가 있는 경우
+                db_module.add_completed_task(
+                    "t_srt_disk", "Harry.Potter.mp4", 50,
+                    r"D:\영화\해리포터\Harry.Potter.srt",
+                    "/api/download/t_srt_disk", "studio"
+                )
+
+                # 4. 단일 업로드 파일 (폴더 정보 없음)
+                db_module.upsert_task(
+                    task_id="t_direct",
+                    filename="single.mp4",
+                    status="COMPLETED",
+                    stage="완료",
+                    progress=100,
+                    video_path=r"D:\dev\sourceCode\transM\backend\data\uploads\t_direct_single.mp4",
+                    srt_path=r"D:\dev\sourceCode\transM\backend\data\processed\t_direct.srt",
+                )
+                db_module.add_completed_task(
+                    "t_direct", "single.mp4", 5,
+                    r"D:\dev\sourceCode\transM\backend\data\processed\t_direct.srt",
+                    "/api/download/t_direct", "studio"
+                )
+
+                rows = db_module.get_completed_tasks(limit=100)
+                folder_by_id = {r["task_id"]: r["video_folder"] for r in rows}
+
+                self.assertEqual(folder_by_id["t_disk"], r"D:\애니메이션\City Hunter\Angel Heart")
+                self.assertEqual(folder_by_id["t_rel"], "City Hunter")
+                self.assertEqual(folder_by_id["t_srt_disk"], r"D:\영화\해리포터")
+                self.assertEqual(folder_by_id["t_direct"], "직접 업로드 (uploads)")
+
+                test_engine.dispose()
+            finally:
+                db_module._engine = orig_engine
+                db_module._is_sqlite = orig_is_sqlite
+                db_module._connected_db_name = orig_db_name
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "9. 작업완료건 영상 폴더별 조회(video_folder) 검증",
+            "status": "PASS",
+            "input": "디스크경로(D:\\애니메이션\\City Hunter\\Angel Heart), 상대경로(City Hunter/Movie.mkv), 디스크SRT(D:\\영화\\해리포터), 직접업로드(single.mp4)",
+            "output": f"t_disk='{folder_by_id['t_disk']}', t_rel='{folder_by_id['t_rel']}', t_srt='{folder_by_id['t_srt_disk']}', t_direct='{folder_by_id['t_direct']}'",
+            "detail": "completed_tasks + transm_tasks JOIN 기반 video_folder 자동 분류 및 Selectbox 그룹핑 데이터 검증 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)

@@ -21,7 +21,9 @@ import {
   CheckCheck,
   Check,
   Archive,
-  FolderDown
+  FolderDown,
+  Folder,
+  X
 } from 'lucide-react';
 import {
   getCompletedTasks,
@@ -44,6 +46,7 @@ const ITEMS_PER_PAGE = 100;
 export default function CompletedList({ onNewTask, onTranslateTask }) {
   const [selectedDetailTaskId, setSelectedDetailTaskId] = useState(null);
   const [activeTab, setActiveTab] = useState('all'); // 'all' | 'studio' | 'translator'
+  const [selectedFolder, setSelectedFolder] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedIds, setSelectedIds] = useState([]);
   const [deleteModalState, setDeleteModalState] = useState({
@@ -90,6 +93,23 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
     return 'studio';
   };
 
+  const getTaskFolder = (task) => {
+    if (task?.video_folder) return task.video_folder;
+    const vp = String(task?.video_path || '').trim();
+    if (vp) {
+      const normVp = vp.replace(/\\/g, '/').toLowerCase();
+      if (!normVp.includes('/data/uploads/')) {
+        const lastSep = Math.max(vp.lastIndexOf('\\'), vp.lastIndexOf('/'));
+        if (lastSep > 0) return vp.slice(0, lastSep);
+      }
+    }
+    const fn = String(task?.filename || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (fn.includes('/')) {
+      return fn.slice(0, fn.lastIndexOf('/'));
+    }
+    return '기타 / 직접 업로드';
+  };
+
   const allTasks = tasks || [];
   const studioTasks = allTasks.filter((t) => getTaskType(t) === 'studio');
   const translatorTasks = allTasks.filter((t) => getTaskType(t) === 'translator');
@@ -99,12 +119,29 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
   const downloadedCount = downloadableTasks.filter((t) => (t.download_count || 0) > 0 || t.downloaded).length;
   const unDownloadedCount = downloadableTasks.length - downloadedCount;
 
-  const filteredTasks =
+  const tabTasks =
     activeTab === 'studio'
       ? studioTasks
       : activeTab === 'translator'
       ? translatorTasks
       : allTasks;
+
+  const folderCountMap = new Map();
+  tabTasks.forEach((t) => {
+    const folder = getTaskFolder(t);
+    folderCountMap.set(folder, (folderCountMap.get(folder) || 0) + 1);
+  });
+  const folderOptions = Array.from(folderCountMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+    .map(([folder, count]) => ({ folder, count }));
+
+  const effectiveSelectedFolder =
+    selectedFolder === 'all' || folderCountMap.has(selectedFolder) ? selectedFolder : 'all';
+
+  const filteredTasks =
+    effectiveSelectedFolder === 'all'
+      ? tabTasks
+      : tabTasks.filter((t) => getTaskFolder(t) === effectiveSelectedFolder);
 
   // Pagination calculation (100 items per page)
   const totalPages = Math.max(1, Math.ceil(filteredTasks.length / ITEMS_PER_PAGE));
@@ -434,7 +471,7 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
           }
         }
       } else if (scope === 'all') {
-        if (activeTab === 'all') {
+        if (activeTab === 'all' && effectiveSelectedFolder === 'all') {
           await deleteAllTasks('all');
           setSelectedIds([]);
           setSelectedDetailTaskId(null);
@@ -824,82 +861,127 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
         </div>
       </div>
 
-      {/* Category Filter Tabs */}
-      <div className="flex flex-wrap items-center gap-2 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl shadow-lg">
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('all');
-            setCurrentPage(1);
-          }}
-          className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-            activeTab === 'all'
-              ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-md shadow-indigo-600/20'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <Layers className="w-4 h-4" />
-          <span>전체 완료건</span>
-          <span
-            className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+      {/* Category Filter Tabs & Folder Selectbox */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-1.5 bg-slate-900 border border-slate-800 rounded-2xl shadow-lg">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('all');
+              setSelectedFolder('all');
+              setCurrentPage(1);
+            }}
+            className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
               activeTab === 'all'
-                ? 'bg-white/20 text-white'
-                : 'bg-slate-800 text-slate-400'
+                ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-md shadow-indigo-600/20'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
             }`}
           >
-            {allTasks.length}
-          </span>
-        </button>
+            <Layers className="w-4 h-4" />
+            <span>전체 완료건</span>
+            <span
+              className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                activeTab === 'all'
+                  ? 'bg-white/20 text-white'
+                  : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {allTasks.length}
+            </span>
+          </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('studio');
-            setCurrentPage(1);
-          }}
-          className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-            activeTab === 'studio'
-              ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-md shadow-indigo-600/20'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <Film className="w-4 h-4" />
-          <span>자막제작 스튜디오 완료건</span>
-          <span
-            className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('studio');
+              setSelectedFolder('all');
+              setCurrentPage(1);
+            }}
+            className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
               activeTab === 'studio'
-                ? 'bg-white/20 text-white'
-                : 'bg-slate-800 text-slate-400'
+                ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-md shadow-indigo-600/20'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
             }`}
           >
-            {studioTasks.length}
-          </span>
-        </button>
+            <Film className="w-4 h-4" />
+            <span>자막제작 스튜디오 완료건</span>
+            <span
+              className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                activeTab === 'studio'
+                  ? 'bg-white/20 text-white'
+                  : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {studioTasks.length}
+            </span>
+          </button>
 
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('translator');
-            setCurrentPage(1);
-          }}
-          className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-            activeTab === 'translator'
-              ? 'bg-gradient-to-r from-sky-600 to-sky-500 text-white shadow-md shadow-sky-600/20'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <Languages className="w-4 h-4" />
-          <span>자막번역기 작업완료건</span>
-          <span
-            className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('translator');
+              setSelectedFolder('all');
+              setCurrentPage(1);
+            }}
+            className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${
               activeTab === 'translator'
-                ? 'bg-white/20 text-white'
-                : 'bg-slate-800 text-slate-400'
+                ? 'bg-gradient-to-r from-sky-600 to-sky-500 text-white shadow-md shadow-sky-600/20'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
             }`}
           >
-            {translatorTasks.length}
-          </span>
-        </button>
+            <Languages className="w-4 h-4" />
+            <span>자막번역기 작업완료건</span>
+            <span
+              className={`px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                activeTab === 'translator'
+                  ? 'bg-white/20 text-white'
+                  : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {translatorTasks.length}
+            </span>
+          </button>
+        </div>
+
+        {/* Folder Category Selectbox */}
+        <div className="flex items-center space-x-2 px-2 pb-1 lg:pb-0 lg:pr-2 min-w-0">
+          <div className="flex items-center space-x-1.5 text-xs font-semibold text-amber-300 whitespace-nowrap flex-shrink-0">
+            <Folder className="w-4 h-4 text-amber-400" />
+            <span>폴더별 조회</span>
+          </div>
+          <select
+            aria-label="영상 폴더별 조회"
+            value={effectiveSelectedFolder}
+            onChange={(e) => {
+              setSelectedFolder(e.target.value);
+              setCurrentPage(1);
+            }}
+            className="min-w-[200px] max-w-xs sm:max-w-sm lg:max-w-md px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 hover:border-amber-500/50 focus:border-amber-500 focus:outline-none text-xs text-slate-100 font-medium truncate cursor-pointer transition"
+            title={effectiveSelectedFolder === 'all' ? '전체 폴더 보기' : effectiveSelectedFolder}
+          >
+            <option value="all">
+              전체 폴더 ({tabTasks.length}건 • {folderOptions.length}개 폴더)
+            </option>
+            {folderOptions.map(({ folder, count }) => (
+              <option key={folder} value={folder}>
+                {folder} ({count}건)
+              </option>
+            ))}
+          </select>
+          {effectiveSelectedFolder !== 'all' && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedFolder('all');
+                setCurrentPage(1);
+              }}
+              className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition flex-shrink-0"
+              title="전체 폴더로 초기화"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Loading Skeleton */}
@@ -1274,10 +1356,17 @@ export default function CompletedList({ onNewTask, onTranslateTask }) {
                         {hasSubtitles ? `${subCount.toLocaleString()}개 자막` : '0개 자막'}
                       </span>
                     </div>
-                    <div className="flex items-center space-x-4 text-xs text-slate-500 flex-wrap">
+                    <div className="flex items-center gap-x-4 gap-y-1 text-xs text-slate-500 flex-wrap">
                       <span className="flex items-center space-x-1">
                         <Clock className="w-3.5 h-3.5 text-slate-400" />
                         <span>완료일: {formatDate(task.completed_at)}</span>
+                      </span>
+                      <span
+                        className="flex items-center space-x-1 text-amber-300/80 max-w-md truncate"
+                        title={`폴더: ${getTaskFolder(task)}`}
+                      >
+                        <Folder className="w-3.5 h-3.5 text-amber-400/80 flex-shrink-0" />
+                        <span className="truncate">{getTaskFolder(task)}</span>
                       </span>
                       {task.last_downloaded_at && (
                         <span className="flex items-center space-x-1 text-blue-400/80">
