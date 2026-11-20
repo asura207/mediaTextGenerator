@@ -513,7 +513,7 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
         # Step 3: LLM Context Refinement (with PostgreSQL batch checkpointing)
         active_cfg = get_active_llm_config()
         active_prov = active_cfg.get("provider", "ollama")
-        active_model_name = active_cfg.get("model", "gemma4:12b")
+        active_model_name = active_cfg.get("model") or active_cfg.get("ollama_model", "qwen2.5:14b")
         tasks[task_id].stage = f"{active_prov.upper()} ({active_model_name}) 모델로 문맥 교정 준비 중..."
         tasks[task_id].progress = 55
         save_task_state(task_id)
@@ -538,7 +538,7 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
             tasks[task_id].progress = min(percent, 89)
             cfg = get_active_llm_config()
             cur_prov = cfg.get("provider", "ollama")
-            cur_llm = cfg.get("model", "gemma4:12b")
+            cur_llm = cfg.get("model") or cfg.get("ollama_model", "qwen2.5:14b")
             tasks[task_id].stage = f"{cur_prov.upper()} ({cur_llm}) 자막 교정 중... ({current_batch}/{total_batches} 완료)"
             save_task_state(task_id)
 
@@ -1365,7 +1365,7 @@ def run_translation_pipeline(
         target_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
         active_cfg = get_active_llm_config()
         prov_name = active_cfg.get("provider", "ollama").upper()
-        model_name = active_cfg.get("model", "gemma4:12b")
+        model_name = active_cfg.get("model") or active_cfg.get("ollama_model", "qwen2.5:14b")
         tasks[trans_task_id].stage = f"{prov_name} ({model_name}) 모델로 {target_name} 번역 준비 중..."
         tasks[trans_task_id].progress = 10
         save_task_state(trans_task_id)
@@ -1388,7 +1388,7 @@ def run_translation_pipeline(
             tasks[trans_task_id].progress = min(pct, 95)
             cfg = get_active_llm_config()
             cur_prov = cfg.get("provider", "ollama").upper()
-            cur_model = cfg.get("model", "gemma4:12b")
+            cur_model = cfg.get("model") or cfg.get("ollama_model", "qwen2.5:14b")
             tasks[trans_task_id].stage = f"{cur_prov} ({cur_model}) 자막 {target_name} 번역 중... ({current_batch}/{total_batches} 완료)"
             save_task_state(trans_task_id)
 

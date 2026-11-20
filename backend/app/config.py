@@ -198,17 +198,30 @@ def get_active_llm_provider() -> str:
 
 def get_active_llm_config() -> Dict[str, Any]:
     s = get_runtime_settings()
-    prov = s.get("llm_provider", "ollama").strip().lower()
+    prov = (s.get("llm_provider") or "ollama").strip().lower()
+    ollama_model = s.get("ollama_model") or OLLAMA_MODEL
+    openai_model = s.get("openai_model") or OPENAI_MODEL
+    anthropic_model = s.get("anthropic_model") or ANTHROPIC_MODEL
+    gemini_model = s.get("gemini_model") or GEMINI_MODEL
+    active_model_map = {
+        "ollama": ollama_model,
+        "openai": openai_model,
+        "anthropic": anthropic_model,
+        "gemini": gemini_model,
+        "google": gemini_model,
+    }
+    active_model = active_model_map.get(prov) or ollama_model
     return {
         "provider": prov,
+        "model": active_model,
         "ollama_host": OLLAMA_HOST,
-        "ollama_model": s.get("ollama_model", OLLAMA_MODEL),
+        "ollama_model": ollama_model,
         "openai_api_key": s.get("openai_api_key", OPENAI_API_KEY),
-        "openai_model": s.get("openai_model", OPENAI_MODEL),
+        "openai_model": openai_model,
         "anthropic_api_key": s.get("anthropic_api_key", ANTHROPIC_API_KEY),
-        "anthropic_model": s.get("anthropic_model", ANTHROPIC_MODEL),
+        "anthropic_model": anthropic_model,
         "gemini_api_key": s.get("gemini_api_key", GEMINI_API_KEY),
-        "gemini_model": s.get("gemini_model", GEMINI_MODEL),
+        "gemini_model": gemini_model,
         "batch_size": int(s.get("llm_batch_size", LLM_BATCH_SIZE)),
     }
 

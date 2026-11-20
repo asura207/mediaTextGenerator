@@ -762,6 +762,37 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "중복 영상 과거건 일괄 삭제 및 신규 완료 시 기존 과거건 자동 대체 통과",
         })
 
+    def test_11_active_llm_config_model_matches_provider(self):
+        """
+        [Case 11] 활성 LLM 설정의 'model' 키 정합성 검증:
+        get_active_llm_config()가 현재 선택된 provider에 맞는 모델명을 'model' 키로 반환하여
+        진행 단계 UI('현재 처리 단계')와 설정 모델명이 항상 일치하는지 검증.
+        """
+        from unittest.mock import patch
+        import app.config as cfg_module
+
+        cases = [
+            ("ollama", {"llm_provider": "ollama", "ollama_model": "qwen2.5:14b"}, "qwen2.5:14b"),
+            ("openai", {"llm_provider": "openai", "openai_model": "gpt-4o-mini"}, "gpt-4o-mini"),
+            ("anthropic", {"llm_provider": "anthropic", "anthropic_model": "claude-3-5-haiku-latest"}, "claude-3-5-haiku-latest"),
+            ("gemini", {"llm_provider": "gemini", "gemini_model": "gemini-2.5-pro"}, "gemini-2.5-pro"),
+        ]
+        results = {}
+        for prov, fake_settings, expected_model in cases:
+            with patch.object(cfg_module, "get_runtime_settings", return_value=fake_settings):
+                active = cfg_module.get_active_llm_config()
+                self.assertEqual(active["provider"], prov)
+                self.assertEqual(active["model"], expected_model)
+                results[prov] = active["model"]
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "11. 활성 LLM 모델명('model' 키) 표시 일치 검증",
+            "status": "PASS",
+            "input": "ollama=qwen2.5:14b, openai=gpt-4o-mini, anthropic=claude-3-5-haiku-latest, gemini=gemini-2.5-pro",
+            "output": ", ".join(f"{k}={v}" for k, v in results.items()),
+            "detail": "get_active_llm_config()['model']이 선택된 provider별 설정 모델명을 정확히 반환함",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)
