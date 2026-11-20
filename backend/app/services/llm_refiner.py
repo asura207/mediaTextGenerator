@@ -928,6 +928,70 @@ def _extract_single_json_text(content: str) -> str:
     return str(content or "").strip()
 
 
+def _pivot_translate_via_english(raw_text: str) -> Optional[str]:
+    """
+    Two-step pivot translation: foreign text -> English -> Korean.
+    Used as a last-resort fallback when direct JP->KO translation fails.
+    Returns pure Korean translation or None if the pivot fails.
+    """
+    raw_clean = str(raw_text or "").strip()
+    if not raw_clean:
+        return None
+    # Step 1: Translate to English
+    try:
+        en_response = chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional subtitle translator. "
+                        "Translate the given dialogue into natural spoken English in ONE concise line. "
+                        "Output ONLY the English translation with no notes or explanations."
+                    ),
+                },
+                {"role": "user", "content": raw_clean},
+            ],
+            temperature=0.15,
+            format_json=False,
+            max_tokens=128,
+            timeout=25.0,
+            max_retries=1,
+        )
+        en_text = normalize_cjk_punctuation(str(en_response).strip())
+        if not en_text:
+            return None
+        # Step 2: Translate English to Korean with Korean prompt + few-shot
+        ko_response = chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 영어 대화를 자연스러운 한국어 구어체 자막으로 번역하는 전문 번역가입니다. "
+                        "설명이 없이 오직 순수 한국어 한글 번역문 한 줄만 출력하세요."
+                    ),
+                },
+                {"role": "user", "content": "Hello? Are you there?"},
+                {"role": "assistant", "content": "여보세요? 거기 계세요?"},
+                {"role": "user", "content": "Wait a second, I am coming right now."},
+                {"role": "assistant", "content": "잠깐만 기다려, 지금 바로 갈게."},
+                {"role": "user", "content": "He just hung up on me, how rude!"},
+                {"role": "assistant", "content": "그놈 전화를 끊어버리다니, 정말 무례하네!"},
+                {"role": "user", "content": en_text},
+            ],
+            temperature=0.15,
+            format_json=False,
+            max_tokens=128,
+            timeout=25.0,
+            max_retries=1,
+        )
+        ko_text = normalize_cjk_punctuation(str(ko_response).strip())
+        if ko_text and is_valid_korean_result(raw_clean, ko_text, {}):
+            return ko_text
+    except Exception as e:
+        logger.debug(f"Pivot translation via English failed: {e}")
+    return None
+
+
 def refine_single_segment_fallback(
     client: Optional[ollama.Client],
     seg_id: int,
@@ -1001,10 +1065,21 @@ def refine_single_segment_fallback(
         except Exception as e:
             logger.warning(f"Single segment refinement failed for #{seg_id} (attempt {attempt + 1}): {e}")
 
-    fb = fast_translate_short(raw_clean) or transliterate_kana_to_hangul(raw_clean) or "..."
-    if fb and dict_map:
-        fb = apply_dictionary_postprocess(raw_clean, fb, dict_map)
-    return fb
+    # Try fast dictionary / Kana transliteration first
+    fb = fast_translate_short(raw_clean) or transliterate_kana_to_hangul(raw_clean)
+    if fb:
+        if dict_map:
+            fb = apply_dictionary_postprocess(raw_clean, fb, dict_map)
+        return fb
+
+    # Last resort: two-step pivot translation (foreign -> English -> Korean)
+    pivot = _pivot_translate_via_english(raw_clean)
+    if pivot:
+        if dict_map:
+            pivot = apply_dictionary_postprocess(raw_clean, pivot, dict_map)
+        return pivot
+
+    return "..."
 
 def refine_subtitles_batch(
     client: Optional[ollama.Client],
