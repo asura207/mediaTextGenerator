@@ -50,6 +50,10 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 
+# Demucs Vocal Separation Configs (Strips BGM/OST accompaniment before Whisper STT)
+VOCAL_SEPARATION_ENABLED = os.getenv("VOCAL_SEPARATION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+VOCAL_SEPARATION_MODEL = os.getenv("VOCAL_SEPARATION_MODEL", "htdemucs").strip() or "htdemucs"
+
 # Database Configs (Auto-detects postgres if configured, otherwise defaults to 'sqlite' for zero-config)
 _raw_db_type = os.getenv("DB_TYPE", "").strip().lower()
 if _raw_db_type:
@@ -113,6 +117,8 @@ def get_runtime_settings(mask_keys: bool = False) -> Dict[str, Any]:
         "whisper_model_size": WHISPER_MODEL_SIZE,
         "whisper_device": WHISPER_DEVICE,
         "whisper_compute_type": WHISPER_COMPUTE_TYPE,
+        "vocal_separation_enabled": VOCAL_SEPARATION_ENABLED,
+        "vocal_separation_model": VOCAL_SEPARATION_MODEL,
         "llm_provider": LLM_PROVIDER,
         "openai_api_key": OPENAI_API_KEY,
         "openai_model": OPENAI_MODEL,
@@ -144,16 +150,25 @@ def get_runtime_settings(mask_keys: bool = False) -> Dict[str, Any]:
 def update_runtime_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     """Updates runtime settings and persists them to settings.json."""
     global _runtime_settings, OLLAMA_MODEL, LLM_BATCH_SIZE, WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+    global VOCAL_SEPARATION_ENABLED, VOCAL_SEPARATION_MODEL
     global LLM_PROVIDER, OPENAI_API_KEY, OPENAI_MODEL, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GEMINI_API_KEY, GEMINI_MODEL
     current = get_runtime_settings(mask_keys=False)
 
     standard_keys = (
         "ollama_model", "whisper_model_size", "whisper_device", "whisper_compute_type",
+        "vocal_separation_model",
         "llm_provider", "openai_model", "anthropic_model", "gemini_model"
     )
     for k in standard_keys:
         if k in updates and updates[k] is not None:
             current[k] = str(updates[k]).strip()
+
+    if "vocal_separation_enabled" in updates and updates["vocal_separation_enabled"] is not None:
+        val = updates["vocal_separation_enabled"]
+        if isinstance(val, bool):
+            current["vocal_separation_enabled"] = val
+        else:
+            current["vocal_separation_enabled"] = str(val).strip().lower() in ("1", "true", "yes", "on")
 
     if "llm_batch_size" in updates and updates["llm_batch_size"] is not None:
         try:
@@ -175,6 +190,8 @@ def update_runtime_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     WHISPER_MODEL_SIZE = current["whisper_model_size"]
     WHISPER_DEVICE = current["whisper_device"]
     WHISPER_COMPUTE_TYPE = current["whisper_compute_type"]
+    VOCAL_SEPARATION_ENABLED = bool(current.get("vocal_separation_enabled", VOCAL_SEPARATION_ENABLED))
+    VOCAL_SEPARATION_MODEL = current.get("vocal_separation_model", VOCAL_SEPARATION_MODEL)
 
     LLM_PROVIDER = current.get("llm_provider", "ollama")
     OPENAI_API_KEY = current.get("openai_api_key", "")
@@ -240,4 +257,13 @@ def get_whisper_config() -> Dict[str, str]:
         "model_size": s.get("whisper_model_size", WHISPER_MODEL_SIZE),
         "device": s.get("whisper_device", WHISPER_DEVICE),
         "compute_type": s.get("whisper_compute_type", WHISPER_COMPUTE_TYPE),
+    }
+
+
+def get_vocal_separation_config() -> Dict[str, Any]:
+    s = get_runtime_settings()
+    return {
+        "enabled": bool(s.get("vocal_separation_enabled", VOCAL_SEPARATION_ENABLED)),
+        "model": s.get("vocal_separation_model") or VOCAL_SEPARATION_MODEL,
+        "prefer_cuda": (s.get("whisper_device", WHISPER_DEVICE) == "cuda"),
     }

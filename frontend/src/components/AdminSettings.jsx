@@ -76,6 +76,8 @@ export default function AdminSettings({ onSettingsUpdated }) {
   const [selectedWhisperModel, setSelectedWhisperModel] = useState('large-v3-turbo');
   const [selectedWhisperDevice, setSelectedWhisperDevice] = useState('cuda');
   const [selectedWhisperCompute, setSelectedWhisperCompute] = useState('float16');
+  const [vocalSeparationEnabled, setVocalSeparationEnabled] = useState(true);
+  const [vocalSeparationAvailable, setVocalSeparationAvailable] = useState(true);
   const [requeueCompleted, setRequeueCompleted] = useState(true);
 
   const [statusMsg, setStatusMsg] = useState(null); // { type: 'success' | 'error' | 'info', text: '' }
@@ -98,6 +100,12 @@ export default function AdminSettings({ onSettingsUpdated }) {
         setSelectedWhisperModel(data.current.whisper_model_size || 'large-v3-turbo');
         setSelectedWhisperDevice(data.current.whisper_device || 'cuda');
         setSelectedWhisperCompute(data.current.whisper_compute_type || 'float16');
+        setVocalSeparationEnabled(
+          data.current.vocal_separation_enabled !== undefined ? Boolean(data.current.vocal_separation_enabled) : true
+        );
+      }
+      if (data?.vocal_separation_available !== undefined) {
+        setVocalSeparationAvailable(Boolean(data.vocal_separation_available));
       }
       if (data?.ollama_models) setOllamaModels(data.ollama_models);
       if (data?.installed_ollama_models) setInstalledModels(data.installed_ollama_models);
@@ -185,6 +193,7 @@ export default function AdminSettings({ onSettingsUpdated }) {
         whisper_model_size: selectedWhisperModel,
         whisper_device: selectedWhisperDevice,
         whisper_compute_type: selectedWhisperCompute,
+        vocal_separation_enabled: vocalSeparationEnabled,
         requeue_completed: requeueCompleted
       };
       const res = await updateSystemSettings(payload);
@@ -817,6 +826,40 @@ export default function AdminSettings({ onSettingsUpdated }) {
               <p className="text-[11px] text-slate-400">
                 RTX 4070 Ti에서는 <strong>float16</strong> 모드가 Tensor 코어를 100% 활용하여 가장 빠르고 정확합니다.
               </p>
+            </div>
+
+            {/* Demucs Vocal Separation Toggle */}
+            <div className="md:col-span-3 pt-3 border-t border-slate-800">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-xl bg-slate-950 border border-slate-800">
+                <label className="flex items-start space-x-3 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={vocalSeparationEnabled}
+                    onChange={(e) => setVocalSeparationEnabled(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded border-slate-600 bg-slate-900 text-teal-500 focus:ring-teal-500 cursor-pointer"
+                  />
+                  <div>
+                    <div className="flex items-center space-x-2">
+                      <span className="text-xs font-bold text-slate-200">
+                        Demucs 보컬 분리 전처리 사용 (OST 노래 가사 및 배경음 제거)
+                      </span>
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded font-semibold border ${
+                          vocalSeparationAvailable
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        }`}
+                      >
+                        {vocalSeparationAvailable ? 'htdemucs 사용 가능' : 'Demucs 미설치 (FFmpeg 폴백)'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Whisper 음성 인식 전에 Demucs(htdemucs)로 반주·배경음악(BGM)을 제거하고 보컬·대사만 분리합니다.
+                      애니메이션 오프닝/엔딩 OST 가사와 BGM이 큰 장면의 자막 인식률이 크게 향상됩니다.
+                    </p>
+                  </div>
+                </label>
+              </div>
             </div>
           </div>
         </div>

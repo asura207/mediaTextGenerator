@@ -12,3 +12,5 @@ nvidia-cublas-cu12>=12.1.0
 nvidia-cudnn-cu12>=9.0.0
 psycopg2-binary>=2.9.9
 sqlalchemy>=2.0.0
+demucs>=4.0.1
+soundfile>=0.12.1

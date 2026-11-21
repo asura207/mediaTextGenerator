@@ -30,6 +30,7 @@ from app.config import (
     get_active_llm_config,
     get_active_llm_provider,
     get_whisper_config,
+    get_vocal_separation_config,
     get_media_scan_dirs
 )
 from app.models import (
@@ -42,6 +43,7 @@ from app.models import (
     CloudLLMTestRequest,
 )
 from app.services.audio_extractor import extract_audio
+from app.services.vocal_separator import separate_vocals_to_wav, is_vocal_separation_available
 from app.services.whisper_stt import transcribe_audio
 from app.services.llm_refiner import refine_subtitles_with_llm
 from app.services.srt_generator import generate_srt_file, optimize_subtitle_timing
@@ -420,10 +422,38 @@ def run_pipeline(task_id: str, video_path: Path, filename: str):
             tasks[task_id].progress = 25
             save_task_state(task_id)
         else:
-            tasks[task_id].stage = "오디오 다이나믹 증폭 및 추출 중 (FFmpeg)..."
-            tasks[task_id].progress = 25
-            save_task_state(task_id)
-            extract_audio(video_path, audio_path)
+            vocal_cfg = get_vocal_separation_config()
+            used_vocal_sep = False
+            if vocal_cfg.get("enabled") and is_vocal_separation_available():
+                def on_vocal_stage(stage_msg: str):
+                    tasks[task_id].stage = stage_msg
+                    tasks[task_id].progress = 20
+                    save_task_state(task_id)
+
+                try:
+                    tasks[task_id].stage = f"Demucs ({vocal_cfg.get('model', 'htdemucs')}) 보컬 분리 및 배경음 제거 중..."
+                    tasks[task_id].progress = 18
+                    save_task_state(task_id)
+                    separate_vocals_to_wav(
+                        video_path,
+                        audio_path,
+                        model_name=vocal_cfg.get("model", "htdemucs"),
+                        prefer_cuda=bool(vocal_cfg.get("prefer_cuda", True)),
+                        progress_callback=on_vocal_stage,
+                    )
+                    tasks[task_id].progress = 25
+                    save_task_state(task_id)
+                    used_vocal_sep = True
+                except ValueError:
+                    raise
+                except Exception as e_sep:
+                    logger.warning(f"Demucs vocal separation failed ({e_sep}). Falling back to standard FFmpeg audio extraction...")
+
+            if not used_vocal_sep:
+                tasks[task_id].stage = "오디오 다이나믹 증폭 및 추출 중 (FFmpeg)..."
+                tasks[task_id].progress = 25
+                save_task_state(task_id)
+                extract_audio(video_path, audio_path)
 
         # For formats unsupported natively in web browsers (WMV, ASF, AVI, etc.), generate preview MP4 in background thread
         if video_path.suffix.lower() in ['.wmv', '.asf', '.avi']:
@@ -2364,6 +2394,8 @@ class SystemSettingsUpdateRequest(BaseModel):
     whisper_model_size: Optional[str] = None
     whisper_device: Optional[str] = None
     whisper_compute_type: Optional[str] = None
+    vocal_separation_enabled: Optional[bool] = None
+    vocal_separation_model: Optional[str] = None
     llm_provider: Optional[str] = None
     openai_api_key: Optional[str] = None
     openai_model: Optional[str] = None
@@ -2521,6 +2553,7 @@ async def get_system_settings_endpoint():
         "whisper_models": WHISPER_MODEL_OPTIONS,
         "whisper_devices": WHISPER_DEVICE_OPTIONS,
         "whisper_compute_types": WHISPER_COMPUTE_OPTIONS,
+        "vocal_separation_available": is_vocal_separation_available(),
         "ollama_host": OLLAMA_HOST
     }
 

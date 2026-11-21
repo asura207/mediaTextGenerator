@@ -793,6 +793,54 @@ class QAPipelineTestSuite(unittest.TestCase):
             "detail": "get_active_llm_config()['model']이 선택된 provider별 설정 모델명을 정확히 반환함",
         })
 
+    def test_12_vocal_separation_config_and_availability(self):
+        """
+        [Case 12] Demucs 보컬 분리 설정(vocal_separation_enabled/model) 및 가용성 검증:
+        get_vocal_separation_config()와 is_vocal_separation_available()가 정상 동작하고
+        설정 토글(True/False)이 반영되는지 검증.
+        """
+        from unittest.mock import patch
+        import app.config as cfg_module
+        from app.services.vocal_separator import is_vocal_separation_available
+
+        avail = is_vocal_separation_available()
+        self.assertTrue(avail, "Demucs vocal separation environment should be available")
+
+        with patch.object(
+            cfg_module,
+            "get_runtime_settings",
+            return_value={
+                "vocal_separation_enabled": True,
+                "vocal_separation_model": "htdemucs",
+                "whisper_device": "cuda",
+            },
+        ):
+            vcfg_on = cfg_module.get_vocal_separation_config()
+            self.assertTrue(vcfg_on["enabled"])
+            self.assertEqual(vcfg_on["model"], "htdemucs")
+            self.assertTrue(vcfg_on["prefer_cuda"])
+
+        with patch.object(
+            cfg_module,
+            "get_runtime_settings",
+            return_value={
+                "vocal_separation_enabled": False,
+                "vocal_separation_model": "htdemucs",
+                "whisper_device": "cpu",
+            },
+        ):
+            vcfg_off = cfg_module.get_vocal_separation_config()
+            self.assertFalse(vcfg_off["enabled"])
+            self.assertFalse(vcfg_off["prefer_cuda"])
+
+        self.__class__.REPORT_ROWS.append({
+            "case": "12. Demucs 보컬 분리 전처리 설정 및 환경 가용성 검증",
+            "status": "PASS",
+            "input": "vocal_separation_enabled=True/False, model=htdemucs, device=cuda/cpu",
+            "output": f"available={avail}, on={vcfg_on}, off={vcfg_off}",
+            "detail": "Demucs(htdemucs) + torch + soundfile 가용성 및 설정 토글 정상 반영 통과",
+        })
+
 
 def run_and_print_report() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(QAPipelineTestSuite)
